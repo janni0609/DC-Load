@@ -8,10 +8,10 @@
         {
             "name": "PlatformIO",
             "includePath": [
-                "D:/GitHub/PsLoad/Software/PlatformIO/DC-Load/include",
-                "D:/GitHub/PsLoad/Software/PlatformIO/DC-Load/src",
+                "D:/GitHub/DC-Load/include",
+                "D:/GitHub/DC-Load/src",
                 "C:/Users/janni/.platformio/packages/framework-arduinopico/libraries/Wire/src",
-                "D:/GitHub/PsLoad/Software/PlatformIO/DC-Load/.pio/libdeps/rpipico2/TFT_eSPI",
+                "D:/GitHub/DC-Load/.pio/libdeps/rpipico2/TFT_eSPI",
                 "C:/Users/janni/.platformio/packages/framework-arduinopico/libraries/LittleFS/src",
                 "C:/Users/janni/.platformio/packages/framework-arduinopico/libraries/SPI/src",
                 "C:/Users/janni/.platformio/packages/framework-arduinopico/cores/rp2040",
@@ -169,10 +169,10 @@
             "browse": {
                 "limitSymbolsToIncludedHeaders": true,
                 "path": [
-                    "D:/GitHub/PsLoad/Software/PlatformIO/DC-Load/include",
-                    "D:/GitHub/PsLoad/Software/PlatformIO/DC-Load/src",
+                    "D:/GitHub/DC-Load/include",
+                    "D:/GitHub/DC-Load/src",
                     "C:/Users/janni/.platformio/packages/framework-arduinopico/libraries/Wire/src",
-                    "D:/GitHub/PsLoad/Software/PlatformIO/DC-Load/.pio/libdeps/rpipico2/TFT_eSPI",
+                    "D:/GitHub/DC-Load/.pio/libdeps/rpipico2/TFT_eSPI",
                     "C:/Users/janni/.platformio/packages/framework-arduinopico/libraries/LittleFS/src",
                     "C:/Users/janni/.platformio/packages/framework-arduinopico/libraries/SPI/src",
                     "C:/Users/janni/.platformio/packages/framework-arduinopico/cores/rp2040",
