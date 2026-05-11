@@ -1,7 +1,11 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <TFT_eSPI.h>
+#include <EEPROM.h>
 #include "TCAL9539.h"
+
+#define EEPROM_SIZE          4
+#define EEPROM_ADDR_ISHUNT   0   // 0x00 = internal, 0x01 = external shunt
 
 // ── DAC80501 ─────────────────────────────────────────────────────────────────
 // Datasheet: SBAS794E (DAC80501/DAC70501/DAC60501)
@@ -169,6 +173,7 @@ uint16_t      g_prevState    = 0xFFFF;
 int8_t        g_cursorPos    = 3;      // 0=hundreds 1=tens 2=ones 3=tenths
 bool          g_loadOn       = false;
 bool          g_extVSense    = false;  // false = internal V-sense, true = external (FET on P11)
+bool          g_extIShunt    = false;  // false = internal current sense (GPIO10 LOW), true = external shunt (GPIO10 HIGH)
 bool          g_editUVP      = false;  // false = editing set current, true = editing UVP
 int8_t        g_uvpCursorPos = 1;      // 0=tens 1=ones 2=tenths 3=hundredths
 unsigned long g_timerStart   = 0;      // millis() snapshot for elapsed timer; reset via P0.6
@@ -218,8 +223,9 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define Y_DBG_ADS   94
 #define Y_DBG_TCAL 108
 #define Y_DBG_FAN  122
-#define Y_DBG_VRAW 136
-#define Y_DBG_IRAW 150
+#define Y_DBG_VRAW   136
+#define Y_DBG_IRAW   150
+#define Y_DBG_ISENSE 164
 
 // Dummy measurement values
 float measV   = 12.34f;
@@ -335,19 +341,21 @@ void drawDebugFrame() {
     hline(Y_DBG_ADS  - 1);
     hline(Y_DBG_TCAL - 1);
     hline(Y_DBG_FAN  - 1);
-    hline(Y_DBG_VRAW - 1);
-    hline(Y_DBG_IRAW - 1);
+    hline(Y_DBG_VRAW   - 1);
+    hline(Y_DBG_IRAW   - 1);
+    hline(Y_DBG_ISENSE - 1);
 
-    drawLabel("TEMP 0",    4, Y_DBG_T0   + 3, 1);
-    drawLabel("TEMP 1",    4, Y_DBG_T1   + 3, 1);
-    drawLabel("TEMP 2",    4, Y_DBG_T2   + 3, 1);
-    drawLabel("UNREG_MON", 4, Y_DBG_GPIO + 3, 1);
-    drawLabel("DAC80501",  4, Y_DBG_DAC  + 3, 1);
-    drawLabel("ADS1115",   4, Y_DBG_ADS  + 3, 1);
-    drawLabel("TCAL9539",  4, Y_DBG_TCAL + 3, 1);
-    drawLabel("FAN PWM",   4, Y_DBG_FAN  + 3, 1);
-    drawLabel("V RAW",     4, Y_DBG_VRAW + 3, 1);
-    drawLabel("I RAW",     4, Y_DBG_IRAW + 3, 1);
+    drawLabel("TEMP 0",    4, Y_DBG_T0    + 3, 1);
+    drawLabel("TEMP 1",    4, Y_DBG_T1    + 3, 1);
+    drawLabel("TEMP 2",    4, Y_DBG_T2    + 3, 1);
+    drawLabel("UNREG_MON", 4, Y_DBG_GPIO  + 3, 1);
+    drawLabel("DAC80501",  4, Y_DBG_DAC   + 3, 1);
+    drawLabel("ADS1115",   4, Y_DBG_ADS   + 3, 1);
+    drawLabel("TCAL9539",  4, Y_DBG_TCAL  + 3, 1);
+    drawLabel("FAN PWM",   4, Y_DBG_FAN   + 3, 1);
+    drawLabel("V RAW",     4, Y_DBG_VRAW  + 3, 1);
+    drawLabel("I RAW",     4, Y_DBG_IRAW  + 3, 1);
+    drawLabel("I SENSE",   4, Y_DBG_ISENSE + 3, 1);
 }
 
 void updateDebugValues() {
@@ -377,6 +385,8 @@ void updateDebugValues() {
     drawValue(buf, 236, Y_DBG_VRAW + 3, 90, 8, COL_VOLT, 1);
     snprintf(buf, sizeof(buf), "%.3fV  +-%.3f", measA / ADS1115_I_SCALE, kPgaFsr[g_pgaA]);
     drawValue(buf, 236, Y_DBG_IRAW + 3, 90, 8, COL_CURR, 1);
+    drawValue(g_extIShunt ? "EXT" : "INT", 236, Y_DBG_ISENSE + 3, 24, 8,
+              g_extIShunt ? COL_VOLT : COL_LABEL, 1);
 }
 
 // ── Set-current editor ───────────────────────────────────────────────────────
@@ -515,14 +525,16 @@ static void handleInputs() {
         uint8_t prevAB = (g_prevState >> 1) & 0x03;
         uint8_t newAB  = (state >> 1) & 0x03;
         acc += enc[(prevAB << 2) | newAB];
-        if (acc <= -4) {
-            acc = 0;
-            if (g_editUVP) { setUVP = constrain(setUVP + kUVPStep[g_uvpCursorPos], 0.0f, 99.99f); drawSetUVP(); }
-            else           { setA   = constrain(setA   + kDigitStep[g_cursorPos],   0.0f, 100.0f); drawSetCurrent(); applySetCurrent(); }
-        } else if (acc >= 4) {
-            acc = 0;
-            if (g_editUVP) { setUVP = constrain(setUVP - kUVPStep[g_uvpCursorPos], 0.0f, 99.99f); drawSetUVP(); }
-            else           { setA   = constrain(setA   - kDigitStep[g_cursorPos],   0.0f, 100.0f); drawSetCurrent(); applySetCurrent(); }
+        if (!g_debugScreen) {
+            if (acc <= -4) {
+                acc = 0;
+                if (g_editUVP) { setUVP = constrain(setUVP + kUVPStep[g_uvpCursorPos], 0.0f, 99.99f); drawSetUVP(); }
+                else           { setA   = constrain(setA   + kDigitStep[g_cursorPos],   0.0f, 100.0f); drawSetCurrent(); applySetCurrent(); }
+            } else if (acc >= 4) {
+                acc = 0;
+                if (g_editUVP) { setUVP = constrain(setUVP - kUVPStep[g_uvpCursorPos], 0.0f, 99.99f); drawSetUVP(); }
+                else           { setA   = constrain(setA   - kDigitStep[g_cursorPos],   0.0f, 100.0f); drawSetCurrent(); applySetCurrent(); }
+            }
         }
     }
 
@@ -534,12 +546,22 @@ static void handleInputs() {
         if (!(btnChanged & (1u << i))) continue;
         bool low = !(state & (1u << i));
         if (!low) continue;  // act on press only
-        if (i == 0)  { g_editUVP = !g_editUVP; drawSetCurrent(); drawSetUVP(); }     // P0.0 = toggle UVP/current edit
-        if (i == 3)  {                                                                // P0.3 = left
+        if (i == 0)  {                                                                // P00 = encoder push button
+            if (g_debugScreen) {
+                g_extIShunt = !g_extIShunt;
+                digitalWrite(PIN_DOUT_10, g_extIShunt ? HIGH : LOW);
+                EEPROM.write(EEPROM_ADDR_ISHUNT, g_extIShunt ? 0x01 : 0x00);
+                EEPROM.commit();
+                updateDebugValues();
+            } else {
+                g_editUVP = !g_editUVP; drawSetCurrent(); drawSetUVP();
+            }
+        }
+        if (i == 3 && !g_debugScreen)  {                                              // P0.3 = left
             if (g_editUVP) { if (g_uvpCursorPos > 0) { g_uvpCursorPos--; drawSetUVP(); } }
             else           { if (g_cursorPos    > 0) { g_cursorPos--;    drawSetCurrent(); } }
         }
-        if (i == 4)  {                                                                // P0.4 = right
+        if (i == 4 && !g_debugScreen)  {                                              // P0.4 = right
             if (g_editUVP) { if (g_uvpCursorPos < 3) { g_uvpCursorPos++; drawSetUVP(); } }
             else           { if (g_cursorPos    < 3) { g_cursorPos++;    drawSetCurrent(); } }
         }
@@ -559,7 +581,7 @@ static void handleInputs() {
             }
         }
         if (i == 6)  { g_timerStart = millis(); measAh = 0.0f; measWh = 0.0f; }                                 // P0.6 = timer + capacity reset
-        if (i == 7)  { g_extVSense = !g_extVSense; ioExp.writePin(9, g_extVSense); drawVSenseIndicator(); }   // P7 = V-sense: P11(bit9) LOW=INT, HIGH=EXT
+        if (i == 7)  { g_extVSense = !g_extVSense; ioExp.writePin(9, g_extVSense); if (!g_debugScreen) drawVSenseIndicator(); }   // P7 = V-sense: P11(bit9) LOW=INT, HIGH=EXT
         if (i == 8)  { g_loadOn = !g_loadOn; digitalWrite(PIN_DOUT_13, g_loadOn ? LOW : HIGH); if (g_loadOn) applySetCurrent(); else dac80501SetVoltage(0); drawHeader(); }  // P10 = on/off; GPIO13 active-low
     }
 }
@@ -580,10 +602,13 @@ void setup() {
     analogWriteFreq(25000);        // 25 kHz — standard PC fan PWM
     analogWrite(PIN_DOUT_2, 0);   // fan 1 — off until temp control kicks in
     analogWrite(PIN_DOUT_3, 0);   // fan 2 — off until temp control kicks in
+    EEPROM.begin(EEPROM_SIZE);
+    g_extIShunt = (EEPROM.read(EEPROM_ADDR_ISHUNT) == 0x01);
+
     pinMode(PIN_DOUT_8,  OUTPUT);
     pinMode(PIN_DOUT_9,  OUTPUT);
     pinMode(PIN_DOUT_10, OUTPUT);
-    digitalWrite(PIN_DOUT_10, LOW);   // current-sense select: LOW = internal
+    digitalWrite(PIN_DOUT_10, g_extIShunt ? HIGH : LOW);  // current-sense select: LOW = internal, HIGH = external shunt
     pinMode(PIN_DOUT_13, OUTPUT);
     digitalWrite(PIN_DOUT_13, HIGH);  // active-low: HIGH = load off at startup
     pinMode(PIN_BEEPER,  OUTPUT);
