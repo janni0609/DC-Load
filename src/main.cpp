@@ -209,15 +209,17 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define Y_SET   250
 #define Y_TEMP  290
 
-// Debug screen section Y positions (header 24 + 3×35 + 40 + 35×4 = 309; screen need not be full)
+// Debug screen section Y positions (header 24 + 10×28 = 304 px; screen need not be full)
 #define Y_DBG_T0    24
-#define Y_DBG_T1    59
-#define Y_DBG_T2    94
-#define Y_DBG_GPIO 129
-#define Y_DBG_DAC  169
-#define Y_DBG_ADS  204
-#define Y_DBG_TCAL 239
-#define Y_DBG_FAN  274
+#define Y_DBG_T1    52
+#define Y_DBG_T2    80
+#define Y_DBG_GPIO 108
+#define Y_DBG_DAC  136
+#define Y_DBG_ADS  164
+#define Y_DBG_TCAL 192
+#define Y_DBG_FAN  220
+#define Y_DBG_VRAW 248
+#define Y_DBG_IRAW 276
 
 // Dummy measurement values
 float measV   = 12.34f;
@@ -333,40 +335,48 @@ void drawDebugFrame() {
     hline(Y_DBG_ADS  - 1);
     hline(Y_DBG_TCAL - 1);
     hline(Y_DBG_FAN  - 1);
+    hline(Y_DBG_VRAW - 1);
+    hline(Y_DBG_IRAW - 1);
 
-    drawLabel("TEMP 0",    4, Y_DBG_T0   + 9);
-    drawLabel("TEMP 1",    4, Y_DBG_T1   + 9);
-    drawLabel("TEMP 2",    4, Y_DBG_T2   + 9);
-    drawLabel("UNREG_MON", 4, Y_DBG_GPIO + 12);
-    drawLabel("DAC80501",  4, Y_DBG_DAC  + 9);
-    drawLabel("ADS1115",   4, Y_DBG_ADS  + 9);
-    drawLabel("TCAL9539",  4, Y_DBG_TCAL + 9);
-    drawLabel("FAN PWM",   4, Y_DBG_FAN  + 9);
+    drawLabel("TEMP 0",    4, Y_DBG_T0   + 6);
+    drawLabel("TEMP 1",    4, Y_DBG_T1   + 6);
+    drawLabel("TEMP 2",    4, Y_DBG_T2   + 6);
+    drawLabel("UNREG_MON", 4, Y_DBG_GPIO + 6);
+    drawLabel("DAC80501",  4, Y_DBG_DAC  + 6);
+    drawLabel("ADS1115",   4, Y_DBG_ADS  + 6);
+    drawLabel("TCAL9539",  4, Y_DBG_TCAL + 6);
+    drawLabel("FAN PWM",   4, Y_DBG_FAN  + 6);
+    drawLabel("V RAW",     4, Y_DBG_VRAW + 6);
+    drawLabel("I RAW",     4, Y_DBG_IRAW + 6);
 }
 
 void updateDebugValues() {
-    char buf[12];
+    char buf[16];
     static const int yBase[] = { Y_DBG_T0, Y_DBG_T1, Y_DBG_T2 };
     for (uint8_t i = 0; i < 3; i++) {
         if (isnan(g_tempAll[i])) {
-            drawValue("N/A", 236, yBase[i] + 9, 72, 16, COL_LABEL, 2);
+            drawValue("N/A", 236, yBase[i] + 6, 72, 16, COL_LABEL, 2);
         } else {
             snprintf(buf, sizeof(buf), "%.1fC", g_tempAll[i]);
             uint16_t col = (g_tempAll[i] >= 60.0f) ? COL_TEMP_HOT : COL_TEMP_OK;
-            drawValue(buf, 236, yBase[i] + 9, 72, 16, col, 2);
+            drawValue(buf, 236, yBase[i] + 6, 72, 16, col, 2);
         }
     }
     bool gpio13 = digitalRead(PIN_DOUT_13);
-    drawValue(gpio13 ? "HIGH" : "LOW", 236, Y_DBG_GPIO + 12, 70, 16,
+    drawValue(gpio13 ? "HIGH" : "LOW", 236, Y_DBG_GPIO + 6, 70, 16,
               gpio13 ? COL_LABEL : COL_CURR, 2);
-    drawValue(g_dacOk  ? "OK" : "ERR", 236, Y_DBG_DAC  + 9, 50, 16,
+    drawValue(g_dacOk  ? "OK" : "ERR", 236, Y_DBG_DAC  + 6, 50, 16,
               g_dacOk  ? COL_CURR : COL_TEMP_HOT, 2);
-    drawValue(g_adsOk  ? "OK" : "ERR", 236, Y_DBG_ADS  + 9, 50, 16,
+    drawValue(g_adsOk  ? "OK" : "ERR", 236, Y_DBG_ADS  + 6, 50, 16,
               g_adsOk  ? COL_CURR : COL_TEMP_HOT, 2);
-    drawValue(g_tcalOk ? "OK" : "ERR", 236, Y_DBG_TCAL + 9, 50, 16,
+    drawValue(g_tcalOk ? "OK" : "ERR", 236, Y_DBG_TCAL + 6, 50, 16,
               g_tcalOk ? COL_CURR : COL_TEMP_HOT, 2);
     snprintf(buf, sizeof(buf), "%3u%%", (uint16_t)g_fanPwm * 100 / 255);
-    drawValue(buf, 236, Y_DBG_FAN + 9, 50, 16, COL_LABEL, 2);
+    drawValue(buf, 236, Y_DBG_FAN + 6, 50, 16, COL_LABEL, 2);
+    snprintf(buf, sizeof(buf), "%.3fV P%u", measV / ADS1115_V_SCALE, g_pgaV);
+    drawValue(buf, 236, Y_DBG_VRAW + 6, 120, 16, COL_VOLT, 2);
+    snprintf(buf, sizeof(buf), "%.3fV P%u", measA / ADS1115_I_SCALE, g_pgaA);
+    drawValue(buf, 236, Y_DBG_IRAW + 6, 120, 16, COL_CURR, 2);
 }
 
 // ── Set-current editor ───────────────────────────────────────────────────────
