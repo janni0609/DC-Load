@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"d:/GitHub/DC-Load\" add src/main.cpp)",
+      "Bash(git -C d:/GitHub/DC-Load commit -m ' *)",
+      "Bash(git -C \"d:/GitHub/DC-Load\" push)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
+    ]
+  }
+}
