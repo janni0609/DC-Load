@@ -209,17 +209,17 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define Y_SET   250
 #define Y_TEMP  290
 
-// Debug screen section Y positions (header 24 + 10×28 = 304 px; screen need not be full)
+// Debug screen section Y positions (header 24 + 10×14 = 164 px; size-1 text = 8px/char)
 #define Y_DBG_T0    24
-#define Y_DBG_T1    52
-#define Y_DBG_T2    80
-#define Y_DBG_GPIO 108
-#define Y_DBG_DAC  136
-#define Y_DBG_ADS  164
-#define Y_DBG_TCAL 192
-#define Y_DBG_FAN  220
-#define Y_DBG_VRAW 248
-#define Y_DBG_IRAW 276
+#define Y_DBG_T1    38
+#define Y_DBG_T2    52
+#define Y_DBG_GPIO  66
+#define Y_DBG_DAC   80
+#define Y_DBG_ADS   94
+#define Y_DBG_TCAL 108
+#define Y_DBG_FAN  122
+#define Y_DBG_VRAW 136
+#define Y_DBG_IRAW 150
 
 // Dummy measurement values
 float measV   = 12.34f;
@@ -260,10 +260,10 @@ void drawVSenseIndicator() {
 void hline(int y) { tft.drawFastHLine(0, y, 240, COL_DIV); }
 void vline(int x, int y, int h) { tft.drawFastVLine(x, y, h, COL_DIV); }
 
-void drawLabel(const char *s, int x, int y) {
+void drawLabel(const char *s, int x, int y, uint8_t sz = 2) {
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setTextSize(2);
+    tft.setTextSize(sz);
     tft.drawString(s, x, y);
 }
 
@@ -338,45 +338,45 @@ void drawDebugFrame() {
     hline(Y_DBG_VRAW - 1);
     hline(Y_DBG_IRAW - 1);
 
-    drawLabel("TEMP 0",    4, Y_DBG_T0   + 6);
-    drawLabel("TEMP 1",    4, Y_DBG_T1   + 6);
-    drawLabel("TEMP 2",    4, Y_DBG_T2   + 6);
-    drawLabel("UNREG_MON", 4, Y_DBG_GPIO + 6);
-    drawLabel("DAC80501",  4, Y_DBG_DAC  + 6);
-    drawLabel("ADS1115",   4, Y_DBG_ADS  + 6);
-    drawLabel("TCAL9539",  4, Y_DBG_TCAL + 6);
-    drawLabel("FAN PWM",   4, Y_DBG_FAN  + 6);
-    drawLabel("V RAW",     4, Y_DBG_VRAW + 6);
-    drawLabel("I RAW",     4, Y_DBG_IRAW + 6);
+    drawLabel("TEMP 0",    4, Y_DBG_T0   + 3, 1);
+    drawLabel("TEMP 1",    4, Y_DBG_T1   + 3, 1);
+    drawLabel("TEMP 2",    4, Y_DBG_T2   + 3, 1);
+    drawLabel("UNREG_MON", 4, Y_DBG_GPIO + 3, 1);
+    drawLabel("DAC80501",  4, Y_DBG_DAC  + 3, 1);
+    drawLabel("ADS1115",   4, Y_DBG_ADS  + 3, 1);
+    drawLabel("TCAL9539",  4, Y_DBG_TCAL + 3, 1);
+    drawLabel("FAN PWM",   4, Y_DBG_FAN  + 3, 1);
+    drawLabel("V RAW",     4, Y_DBG_VRAW + 3, 1);
+    drawLabel("I RAW",     4, Y_DBG_IRAW + 3, 1);
 }
 
 void updateDebugValues() {
-    char buf[16];
+    char buf[24];
     static const int yBase[] = { Y_DBG_T0, Y_DBG_T1, Y_DBG_T2 };
     for (uint8_t i = 0; i < 3; i++) {
         if (isnan(g_tempAll[i])) {
-            drawValue("N/A", 236, yBase[i] + 6, 72, 16, COL_LABEL, 2);
+            drawValue("N/A", 236, yBase[i] + 3, 36, 8, COL_LABEL, 1);
         } else {
             snprintf(buf, sizeof(buf), "%.1fC", g_tempAll[i]);
             uint16_t col = (g_tempAll[i] >= 60.0f) ? COL_TEMP_HOT : COL_TEMP_OK;
-            drawValue(buf, 236, yBase[i] + 6, 72, 16, col, 2);
+            drawValue(buf, 236, yBase[i] + 3, 36, 8, col, 1);
         }
     }
     bool gpio13 = digitalRead(PIN_DOUT_13);
-    drawValue(gpio13 ? "HIGH" : "LOW", 236, Y_DBG_GPIO + 6, 70, 16,
-              gpio13 ? COL_LABEL : COL_CURR, 2);
-    drawValue(g_dacOk  ? "OK" : "ERR", 236, Y_DBG_DAC  + 6, 50, 16,
-              g_dacOk  ? COL_CURR : COL_TEMP_HOT, 2);
-    drawValue(g_adsOk  ? "OK" : "ERR", 236, Y_DBG_ADS  + 6, 50, 16,
-              g_adsOk  ? COL_CURR : COL_TEMP_HOT, 2);
-    drawValue(g_tcalOk ? "OK" : "ERR", 236, Y_DBG_TCAL + 6, 50, 16,
-              g_tcalOk ? COL_CURR : COL_TEMP_HOT, 2);
+    drawValue(gpio13 ? "HIGH" : "LOW", 236, Y_DBG_GPIO + 3, 30, 8,
+              gpio13 ? COL_LABEL : COL_CURR, 1);
+    drawValue(g_dacOk  ? "OK" : "ERR", 236, Y_DBG_DAC  + 3, 18, 8,
+              g_dacOk  ? COL_CURR : COL_TEMP_HOT, 1);
+    drawValue(g_adsOk  ? "OK" : "ERR", 236, Y_DBG_ADS  + 3, 18, 8,
+              g_adsOk  ? COL_CURR : COL_TEMP_HOT, 1);
+    drawValue(g_tcalOk ? "OK" : "ERR", 236, Y_DBG_TCAL + 3, 18, 8,
+              g_tcalOk ? COL_CURR : COL_TEMP_HOT, 1);
     snprintf(buf, sizeof(buf), "%3u%%", (uint16_t)g_fanPwm * 100 / 255);
-    drawValue(buf, 236, Y_DBG_FAN + 6, 50, 16, COL_LABEL, 2);
-    snprintf(buf, sizeof(buf), "%.3fV P%u", measV / ADS1115_V_SCALE, g_pgaV);
-    drawValue(buf, 236, Y_DBG_VRAW + 6, 120, 16, COL_VOLT, 2);
-    snprintf(buf, sizeof(buf), "%.3fV P%u", measA / ADS1115_I_SCALE, g_pgaA);
-    drawValue(buf, 236, Y_DBG_IRAW + 6, 120, 16, COL_CURR, 2);
+    drawValue(buf, 236, Y_DBG_FAN + 3, 24, 8, COL_LABEL, 1);
+    snprintf(buf, sizeof(buf), "%.3fV  +-%.3f", measV / ADS1115_V_SCALE, kPgaFsr[g_pgaV]);
+    drawValue(buf, 236, Y_DBG_VRAW + 3, 90, 8, COL_VOLT, 1);
+    snprintf(buf, sizeof(buf), "%.3fV  +-%.3f", measA / ADS1115_I_SCALE, kPgaFsr[g_pgaA]);
+    drawValue(buf, 236, Y_DBG_IRAW + 3, 90, 8, COL_CURR, 1);
 }
 
 // ── Set-current editor ───────────────────────────────────────────────────────
@@ -434,32 +434,69 @@ void drawSetUVP() {
 void updateValues() {
     char buf[24];
 
-    // Big three — textSize 3 (18×24 px/char), right-align at x=236
+    // Big values — one 230×26 sprite reused for V, A, W (7 allocs → 3)
+    spr.createSprite(230, 26);
+    spr.setTextDatum(TR_DATUM);
+    spr.setTextSize(3);
+
+    spr.fillSprite(COL_BG);
+    spr.setTextColor(COL_VOLT, COL_BG);
     snprintf(buf, sizeof(buf), "%.2f V", measV);
-    drawValue(buf, 236, Y_VOLT + 34, 230, 26, COL_VOLT, 3);
+    spr.drawString(buf, 230, 0);
+    spr.pushSprite(6, Y_VOLT + 34);
 
+    spr.fillSprite(COL_BG);
+    spr.setTextColor(COL_CURR, COL_BG);
     snprintf(buf, sizeof(buf), "%.3f A", measA);
-    drawValue(buf, 236, Y_CURR + 34, 230, 26, COL_CURR, 3);
+    spr.drawString(buf, 230, 0);
+    spr.pushSprite(6, Y_CURR + 34);
 
+    spr.fillSprite(COL_BG);
+    spr.setTextColor(COL_PWR, COL_BG);
     snprintf(buf, sizeof(buf), "%.2f W", measW);
-    drawValue(buf, 236, Y_PWR  + 34, 230, 26, COL_PWR,  3);
+    spr.drawString(buf, 230, 0);
+    spr.pushSprite(6, Y_PWR + 34);
 
-    // Split rows — textSize 2 (12×16 px/char)
-    // Left half: right-align at x=115  |  Right half: right-align at x=235
+    spr.deleteSprite();
+
+    // Half-width rows — one 110×16 sprite reused for Ah and Wh
+    spr.createSprite(110, 16);
+    spr.setTextDatum(TR_DATUM);
+    spr.setTextColor(COL_CAP, COL_BG);
+    spr.setTextSize(2);
+
+    spr.fillSprite(COL_BG);
     snprintf(buf, sizeof(buf), "%.3f Ah", measAh);
-    drawValue(buf, 115, Y_CAP + 22, 110, 16, COL_CAP, 2);
+    spr.drawString(buf, 110, 0);
+    spr.pushSprite(5, Y_CAP + 22);
 
+    spr.fillSprite(COL_BG);
     snprintf(buf, sizeof(buf), "%.2f Wh", measWh);
-    drawValue(buf, 235, Y_CAP + 22, 110, 16, COL_CAP, 2);
+    spr.drawString(buf, 110, 0);
+    spr.pushSprite(125, Y_CAP + 22);
 
-    // Temp — left half (after "TEMP" label at x=4, 4×12=48 px)
+    spr.deleteSprite();
+
+    // Temp + timer — one sprite spanning screen x=53..234 (covers both halves)
+    // Divider at screen x=119 → sprite x=66; must be redrawn to avoid erasure
+    spr.createSprite(182, 18);
+    spr.fillSprite(COL_BG);
+    spr.drawFastVLine(66, 0, 18, COL_DIV);
+    spr.setTextDatum(TR_DATUM);
+    spr.setTextSize(2);
+
     snprintf(buf, sizeof(buf), "%.1fC", tempC);
     uint16_t tc = (tempC >= 60.0f) ? COL_TEMP_HOT : COL_TEMP_OK;
-    drawValue(buf, 115, Y_TEMP + 7, 62, 18, tc, 2);
-    // Elapsed timer — right half; reset via P0.6 button
+    spr.setTextColor(tc, COL_BG);
+    spr.drawString(buf, 62, 0);
+
     unsigned long elapsed = (millis() - g_timerStart) / 1000UL;
     snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu", elapsed / 3600, (elapsed % 3600) / 60, elapsed % 60);
-    drawValue(buf, 235, Y_TEMP + 7, 114, 18, COL_CAP, 2);
+    spr.setTextColor(COL_CAP, COL_BG);
+    spr.drawString(buf, 182, 0);
+
+    spr.pushSprite(53, Y_TEMP + 7);
+    spr.deleteSprite();
 }
 
 // ── Input handling ────────────────────────────────────────────────────────────
@@ -622,6 +659,7 @@ void setup() {
 }
 
 void loop() {
+    // ~1 µs when idle; ~2.4 ms when interrupt fired (TCAL9539 I2C readPorts over Wire1 @ 1 MHz)
     handleInputs();
 
     static unsigned long lastUpdate = 0;
@@ -652,13 +690,13 @@ void loop() {
         float dtH = (now - lastUpdate) / 3600000.0f;
         lastUpdate = now;
 
-        float v = ads1115ReadVoltage();   // ~16 ms blocking
+        float v = ads1115ReadVoltage();   // ~15.5 ms — one 64-SPS single-shot conversion period
         if (!isnan(v)) measV = v;
-        handleInputs();                   // service any pending input before second conversion
+        handleInputs();
 
-        float a = ads1115ReadCurrent();   // ~16 ms blocking
+        float a = ads1115ReadCurrent();   // ~15.5 ms — same
         if (!isnan(a)) measA = a;
-        handleInputs();                   // service any pending input before display update
+        handleInputs();
 
         measW = measV * measA;
         digitalWrite(PIN_BEEPER, measW > 1000.0f ? HIGH : LOW);
@@ -667,6 +705,6 @@ void loop() {
             measWh += measW * dtH;
         }
 
-        if (!g_debugScreen) updateValues();
+        if (!g_debugScreen) updateValues();  // ~13.8 ms — 3 sprite groups pushed to TFT via SPI
     }
 }
