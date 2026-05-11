@@ -209,14 +209,15 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define Y_SET   250
 #define Y_TEMP  290
 
-// Debug screen section Y positions (header 24 + 3×50 + 40 + 35 + 35 + 36 = 320)
+// Debug screen section Y positions (header 24 + 3×35 + 40 + 35×4 = 309; screen need not be full)
 #define Y_DBG_T0    24
-#define Y_DBG_T1    74
-#define Y_DBG_T2   124
-#define Y_DBG_GPIO 174
-#define Y_DBG_DAC  214
-#define Y_DBG_ADS  249
-#define Y_DBG_TCAL 284
+#define Y_DBG_T1    59
+#define Y_DBG_T2    94
+#define Y_DBG_GPIO 129
+#define Y_DBG_DAC  169
+#define Y_DBG_ADS  204
+#define Y_DBG_TCAL 239
+#define Y_DBG_FAN  274
 
 // Dummy measurement values
 float measV   = 12.34f;
@@ -228,10 +229,11 @@ float setA    = 6.000f;
 float setUVP  = 10.00f;
 float tempC   = 42.5f;
 float g_tempAll[3]   = {NAN, NAN, NAN};
-bool  g_debugScreen  = false;
-bool  g_dacOk        = false;
-bool  g_adsOk        = false;
-bool  g_tcalOk       = false;
+bool    g_debugScreen  = false;
+bool    g_dacOk        = false;
+bool    g_adsOk        = false;
+bool    g_tcalOk       = false;
+uint8_t g_fanPwm       = 0;
 
 // 100 A → 2.5 V; DAC always tracks setpoint, load on/off is handled by a separate enable signal
 static void applySetCurrent() {
@@ -330,14 +332,16 @@ void drawDebugFrame() {
     hline(Y_DBG_DAC  - 1);
     hline(Y_DBG_ADS  - 1);
     hline(Y_DBG_TCAL - 1);
+    hline(Y_DBG_FAN  - 1);
 
-    drawLabel("TEMP 0",    4, Y_DBG_T0   + 4);
-    drawLabel("TEMP 1",    4, Y_DBG_T1   + 4);
-    drawLabel("TEMP 2",    4, Y_DBG_T2   + 4);
+    drawLabel("TEMP 0",    4, Y_DBG_T0   + 9);
+    drawLabel("TEMP 1",    4, Y_DBG_T1   + 9);
+    drawLabel("TEMP 2",    4, Y_DBG_T2   + 9);
     drawLabel("UNREG_MON", 4, Y_DBG_GPIO + 12);
     drawLabel("DAC80501",  4, Y_DBG_DAC  + 9);
     drawLabel("ADS1115",   4, Y_DBG_ADS  + 9);
     drawLabel("TCAL9539",  4, Y_DBG_TCAL + 9);
+    drawLabel("FAN PWM",   4, Y_DBG_FAN  + 9);
 }
 
 void updateDebugValues() {
@@ -345,11 +349,11 @@ void updateDebugValues() {
     static const int yBase[] = { Y_DBG_T0, Y_DBG_T1, Y_DBG_T2 };
     for (uint8_t i = 0; i < 3; i++) {
         if (isnan(g_tempAll[i])) {
-            drawValue("N/A", 236, yBase[i] + 22, 120, 26, COL_LABEL, 3);
+            drawValue("N/A", 236, yBase[i] + 9, 72, 16, COL_LABEL, 2);
         } else {
             snprintf(buf, sizeof(buf), "%.1fC", g_tempAll[i]);
             uint16_t col = (g_tempAll[i] >= 60.0f) ? COL_TEMP_HOT : COL_TEMP_OK;
-            drawValue(buf, 236, yBase[i] + 22, 120, 26, col, 3);
+            drawValue(buf, 236, yBase[i] + 9, 72, 16, col, 2);
         }
     }
     bool gpio13 = digitalRead(PIN_DOUT_13);
@@ -361,6 +365,8 @@ void updateDebugValues() {
               g_adsOk  ? COL_CURR : COL_TEMP_HOT, 2);
     drawValue(g_tcalOk ? "OK" : "ERR", 236, Y_DBG_TCAL + 9, 50, 16,
               g_tcalOk ? COL_CURR : COL_TEMP_HOT, 2);
+    snprintf(buf, sizeof(buf), "%3u%%", (uint16_t)g_fanPwm * 100 / 255);
+    drawValue(buf, 236, Y_DBG_FAN + 9, 50, 16, COL_LABEL, 2);
 }
 
 // ── Set-current editor ───────────────────────────────────────────────────────
@@ -621,9 +627,9 @@ void loop() {
         for (float ti : g_tempAll) if (!isnan(ti) && (isnan(tMax) || ti > tMax)) tMax = ti;
         if (!isnan(tMax)) tempC = tMax;
         // off below 35°C, linear ramp to 100% at 55°C
-        uint8_t fanPwm = (uint8_t)constrain((tempC - 35.0f) / 20.0f * 255.0f, 0.0f, 255.0f);
-        analogWrite(PIN_DOUT_2, fanPwm);
-        analogWrite(PIN_DOUT_3, fanPwm);
+        g_fanPwm = (uint8_t)constrain((tempC - 35.0f) / 20.0f * 255.0f, 0.0f, 255.0f);
+        analogWrite(PIN_DOUT_2, g_fanPwm);
+        analogWrite(PIN_DOUT_3, g_fanPwm);
         if (g_debugScreen) {
             g_dacOk  = dac80501Verify();
             g_adsOk  = ads1115Ping();
