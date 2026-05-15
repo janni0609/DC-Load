@@ -4,8 +4,24 @@
 #include <EEPROM.h>
 #include "TCAL9539.h"
 
-#define EEPROM_SIZE          4
-#define EEPROM_ADDR_ISHUNT   0   // 0x00 = internal, 0x01 = external shunt
+// EEPROM layout:
+//   0       ISHUNT select (1 byte)
+//   1       current cal valid marker (0xCA = valid)
+//   2       voltage cal valid marker (0xCA = valid)
+//   3..42   current cal: 5×rawA + 5×userA (10 floats = 40 bytes)
+//   43..58  voltage cal: 2×rawV + 2×userV (4 floats = 16 bytes)
+//   59      OTP valid marker (0xCA = valid)
+//   60..63  OTP threshold (1 float = 4 bytes)
+#define EEPROM_SIZE              64
+#define EEPROM_ADDR_ISHUNT        0
+#define EEPROM_ADDR_CAL_A_VALID   1
+#define EEPROM_ADDR_CAL_V_VALID   2
+#define EEPROM_ADDR_CAL_RAW_A     3   // 5 floats (20 bytes)
+#define EEPROM_ADDR_CAL_USER_A   23   // 5 floats (20 bytes)
+#define EEPROM_ADDR_CAL_RAW_V    43   // 2 floats (8 bytes)
+#define EEPROM_ADDR_CAL_USER_V   51   // 2 floats (8 bytes)
+#define EEPROM_ADDR_OTP_VALID    59
+#define EEPROM_ADDR_OTP_TEMP     60
 
 // ── DAC80501 ─────────────────────────────────────────────────────────────────
 // Datasheet: SBAS794E (DAC80501/DAC70501/DAC60501)
@@ -226,6 +242,10 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define Y_DBG_VRAW   136
 #define Y_DBG_IRAW   150
 #define Y_DBG_ISENSE 164
+#define Y_DBG_CAL_V    178
+#define Y_DBG_CAL_A    192
+#define Y_DBG_CAL_VIEW 206
+#define Y_DBG_OTP      220
 
 // Dummy measurement values
 float measV   = 12.34f;
@@ -243,9 +263,104 @@ bool    g_adsOk        = false;
 bool    g_tcalOk       = false;
 uint8_t g_fanPwm       = 0;
 
+float g_rawV = 0.0f;   // last raw ads1115ReadVoltage() result (uncalibrated)
+float g_rawA = 0.0f;   // last raw ads1115ReadCurrent() result (uncalibrated)
+
+// Piecewise-linear calibration tables (loaded from EEPROM; identity by default)
+float    g_calPtsRawA[5]  = { 0.0f, 0.5f,  2.0f, 10.0f, 60.0f };
+float    g_calPtsUserA[5] = { 0.0f, 0.5f,  2.0f, 10.0f, 60.0f };
+float    g_calPtsRawV[2]  = { 5.0f, 50.0f };
+float    g_calPtsUserV[2] = { 5.0f, 50.0f };
+bool     g_calACal        = false;   // true when a valid current cal is stored
+bool     g_calVCal        = false;   // true when a valid voltage cal is stored
+float    g_otpTemp        = 70.0f;   // over-temp protection threshold [°C]
+bool     g_otpTriggered   = false;   // true after OTP fires; clears when temp < threshold-5°C
+
+uint8_t       g_beepCount = 0;       // OTP alarm: remaining beeps (0 = idle)
+bool          g_beepPhase = false;   // current beep phase: true = ON
+unsigned long g_beepNext  = 0;       // millis() of next beep state change
+
+// Calibration UI (scratch space used during the calibration procedure)
+enum CalMode : uint8_t { CAL_NONE = 0, CAL_CURR = 1, CAL_VOLT = 2 };
+CalMode  g_calMode      = CAL_NONE;
+uint8_t  g_calStep      = 0;
+float    g_calUserVal   = 0.0f;
+int8_t   g_calCursor    = 0;
+float    g_calRaw[5];
+float    g_calUser[5];
+bool     g_calSavedLoad  = false;
+float    g_calSavedSetA  = 0.0f;
+bool     g_calViewScreen = false;
+int8_t   g_dbgMenuSel    = -1;     // -1=none, 0=VOLT CAL, 1=CURR CAL, 2=VIEW CAL
+
+static const float   kCalCurrSetPt[]  = { 0.0f, 0.5f, 2.0f, 10.0f, 60.0f };
+static const uint8_t kCalCurrNPts     = 5;
+static const float   kCalStep[]       = { 10.0f, 1.0f, 0.1f, 0.01f, 0.001f };
+static const uint8_t kCalNDigits      = 5;
+static const uint8_t kCalCharIdx[]    = { 0, 1, 3, 4, 5 };
+
+// Piecewise linear interpolation through n points (xs must be monotone increasing).
+// Extrapolates linearly beyond the endpoints using the adjacent segment.
+static float piecewiseLerp(const float *xs, const float *ys, uint8_t n, float x) {
+    if (n < 2) return x;
+    uint8_t lo = 0, hi = n - 1;
+    if (x <= xs[lo]) { lo = 0; hi = 1; }
+    else if (x >= xs[hi]) { lo = n - 2; hi = n - 1; }
+    else { for (uint8_t i = 0; i < n - 1; i++) if (x <= xs[i+1]) { lo = i; hi = i+1; break; } }
+    float dx = xs[hi] - xs[lo];
+    return fabsf(dx) < 1e-9f ? ys[lo] : ys[lo] + (x - xs[lo]) * (ys[hi] - ys[lo]) / dx;
+}
+
 // 100 A → 2.5 V; DAC always tracks setpoint, load on/off is handled by a separate enable signal
 static void applySetCurrent() {
-    dac80501SetVoltage(setA / 100.0f * 2.5f);
+    // Inverse map: desired actual current → nominal DAC setpoint.
+    // Forward cal: kCalCurrSetPt[i] (nominal) → g_calPtsUserA[i] (measured actual).
+    // Inverse: use userA as x-axis, nominal setpoints as y-axis.
+    float nominal = g_calACal
+        ? piecewiseLerp(g_calPtsUserA, kCalCurrSetPt, kCalCurrNPts, setA)
+        : setA;
+    dac80501SetVoltage(constrain(nominal, 0.0f, 100.0f) / 100.0f * 2.5f);
+}
+
+static void loadCalParams() {
+    if (EEPROM.read(EEPROM_ADDR_CAL_A_VALID) == 0xCA) {
+        for (uint8_t i = 0; i < kCalCurrNPts; i++) {
+            EEPROM.get(EEPROM_ADDR_CAL_RAW_A  + i * 4, g_calPtsRawA[i]);
+            EEPROM.get(EEPROM_ADDR_CAL_USER_A + i * 4, g_calPtsUserA[i]);
+        }
+        g_calACal = true;
+    }
+    if (EEPROM.read(EEPROM_ADDR_CAL_V_VALID) == 0xCA) {
+        for (uint8_t i = 0; i < 2; i++) {
+            EEPROM.get(EEPROM_ADDR_CAL_RAW_V  + i * 4, g_calPtsRawV[i]);
+            EEPROM.get(EEPROM_ADDR_CAL_USER_V + i * 4, g_calPtsUserV[i]);
+        }
+        g_calVCal = true;
+    }
+    if (EEPROM.read(EEPROM_ADDR_OTP_VALID) == 0xCA) {
+        EEPROM.get(EEPROM_ADDR_OTP_TEMP, g_otpTemp);
+        g_otpTemp = constrain(g_otpTemp, 30.0f, 120.0f);
+    }
+}
+
+static void saveOtpTemp() {
+    EEPROM.write(EEPROM_ADDR_OTP_VALID, 0xCA);
+    EEPROM.put(EEPROM_ADDR_OTP_TEMP, g_otpTemp);
+    EEPROM.commit();
+}
+
+static void saveCalParams() {
+    for (uint8_t i = 0; i < kCalCurrNPts; i++) {
+        EEPROM.put(EEPROM_ADDR_CAL_RAW_A  + i * 4, g_calPtsRawA[i]);
+        EEPROM.put(EEPROM_ADDR_CAL_USER_A + i * 4, g_calPtsUserA[i]);
+    }
+    for (uint8_t i = 0; i < 2; i++) {
+        EEPROM.put(EEPROM_ADDR_CAL_RAW_V  + i * 4, g_calPtsRawV[i]);
+        EEPROM.put(EEPROM_ADDR_CAL_USER_V + i * 4, g_calPtsUserV[i]);
+    }
+    EEPROM.write(EEPROM_ADDR_CAL_A_VALID, g_calACal ? 0xCA : 0x00);
+    EEPROM.write(EEPROM_ADDR_CAL_V_VALID, g_calVCal ? 0xCA : 0x00);
+    EEPROM.commit();
 }
 
 static float readMCP9700(uint8_t pin) {
@@ -344,10 +459,14 @@ void drawDebugFrame() {
     hline(Y_DBG_VRAW   - 1);
     hline(Y_DBG_IRAW   - 1);
     hline(Y_DBG_ISENSE - 1);
+    hline(Y_DBG_CAL_V    - 1);
+    hline(Y_DBG_CAL_A    - 1);
+    hline(Y_DBG_CAL_VIEW - 1);
+    hline(Y_DBG_OTP      - 1);
 
-    drawLabel("TEMP 0",    4, Y_DBG_T0    + 3, 1);
-    drawLabel("TEMP 1",    4, Y_DBG_T1    + 3, 1);
-    drawLabel("TEMP 2",    4, Y_DBG_T2    + 3, 1);
+    drawLabel("TEMP right",4, Y_DBG_T0    + 3, 1);
+    drawLabel("TEMP left", 4, Y_DBG_T1    + 3, 1);
+    drawLabel("TEMP board",4, Y_DBG_T2    + 3, 1);
     drawLabel("UNREG_MON", 4, Y_DBG_GPIO  + 3, 1);
     drawLabel("DAC80501",  4, Y_DBG_DAC   + 3, 1);
     drawLabel("ADS1115",   4, Y_DBG_ADS   + 3, 1);
@@ -355,7 +474,7 @@ void drawDebugFrame() {
     drawLabel("FAN PWM",   4, Y_DBG_FAN   + 3, 1);
     drawLabel("V RAW",     4, Y_DBG_VRAW  + 3, 1);
     drawLabel("I RAW",     4, Y_DBG_IRAW  + 3, 1);
-    drawLabel("I SENSE",   4, Y_DBG_ISENSE + 3, 1);
+    // I SENSE row is drawn by updateDebugValues() with dynamic highlight
 }
 
 void updateDebugValues() {
@@ -381,12 +500,39 @@ void updateDebugValues() {
               g_tcalOk ? COL_CURR : COL_TEMP_HOT, 1);
     snprintf(buf, sizeof(buf), "%3u%%", (uint16_t)g_fanPwm * 100 / 255);
     drawValue(buf, 236, Y_DBG_FAN + 3, 24, 8, COL_LABEL, 1);
-    snprintf(buf, sizeof(buf), "%.3fV  +-%.3f", measV / ADS1115_V_SCALE, kPgaFsr[g_pgaV]);
+    snprintf(buf, sizeof(buf), "%.3fV  +-%.3f", g_rawV / ADS1115_V_SCALE, kPgaFsr[g_pgaV]);
     drawValue(buf, 236, Y_DBG_VRAW + 3, 90, 8, COL_VOLT, 1);
-    snprintf(buf, sizeof(buf), "%.3fV  +-%.3f", measA / ADS1115_I_SCALE, kPgaFsr[g_pgaA]);
+    snprintf(buf, sizeof(buf), "%.3fV  +-%.3f", g_rawA / ADS1115_I_SCALE, kPgaFsr[g_pgaA]);
     drawValue(buf, 236, Y_DBG_IRAW + 3, 90, 8, COL_CURR, 1);
-    drawValue(g_extIShunt ? "EXT" : "INT", 236, Y_DBG_ISENSE + 3, 24, 8,
-              g_extIShunt ? COL_VOLT : COL_LABEL, 1);
+    // Selectable menu rows (I SENSE + calibration items + OTP)
+    const char* calLabels[5] = { "I SENSE", "VOLT CAL", "CURR CAL", "VIEW CAL", "OTP TRIP" };
+    const int   calY[5]      = { Y_DBG_ISENSE, Y_DBG_CAL_V, Y_DBG_CAL_A, Y_DBG_CAL_VIEW, Y_DBG_OTP };
+    for (int8_t s = 0; s < 5; s++) {
+        bool hl = (g_dbgMenuSel == s);
+        tft.fillRect(0, calY[s], 240, 14, hl ? COL_SET : COL_BG);
+        tft.setTextSize(1);
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextColor(hl ? COL_BG : COL_LABEL, hl ? COL_SET : COL_BG);
+        tft.drawString(calLabels[s], 4, calY[s] + 3);
+        tft.setTextDatum(TR_DATUM);
+        const char *badge;
+        uint16_t badgeCol;
+        if (s == 0) {
+            badge    = g_extIShunt ? "EXT" : "INT";
+            badgeCol = hl ? COL_BG : (g_extIShunt ? COL_VOLT : COL_LABEL);
+        } else if (s == 4) {
+            snprintf(buf, sizeof(buf), "%.0fC", g_otpTemp);
+            badge    = buf;
+            badgeCol = hl ? COL_BG : (g_otpTriggered ? COL_TEMP_HOT : COL_TEMP_OK);
+        } else {
+            badge    = (s == 1) ? (g_calVCal ? "CAL" : "---")
+                     : (s == 2) ? (g_calACal ? "CAL" : "---")
+                     : "-->";
+            badgeCol = hl ? COL_BG : COL_LABEL;
+        }
+        tft.setTextColor(badgeCol, hl ? COL_SET : COL_BG);
+        tft.drawString(badge, 236, calY[s] + 3);
+    }
 }
 
 // ── Set-current editor ───────────────────────────────────────────────────────
@@ -507,6 +653,241 @@ void updateValues() {
 
     spr.pushSprite(53, Y_TEMP + 7);
     spr.deleteSprite();
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextSize(2);
+    tft.setTextColor(g_otpTriggered ? COL_TEMP_HOT : COL_LABEL, COL_BG);
+    tft.drawString("TEMP", 4, Y_TEMP + 7);
+}
+
+// ── Calibration screen ────────────────────────────────────────────────────────
+
+// Draws the 6-char "%6.3f" digit-editor widget centered on screen at y=180.
+static void drawCalInput() {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%6.3f", g_calUserVal);
+    const int x0 = (240 - 6 * 12) / 2;
+    const int y  = 180;
+    tft.setTextSize(2);
+    tft.setTextDatum(TL_DATUM);
+    for (uint8_t i = 0; i < 6; i++) {
+        bool hl = false;
+        for (uint8_t j = 0; j < kCalNDigits; j++) {
+            if (kCalCharIdx[j] == i && g_calCursor == (int8_t)j) { hl = true; break; }
+        }
+        int cx = x0 + i * 12;
+        tft.fillRect(cx, y, 12, 16, hl ? COL_SET : COL_BG);
+        tft.setTextColor(hl ? COL_BG : COL_SET, hl ? COL_SET : COL_BG);
+        char cs[2] = { buf[i], '\0' };
+        tft.drawString(cs, cx, y);
+    }
+}
+
+static void drawCalFrame() {
+    tft.fillScreen(COL_BG);
+    tft.fillRect(0, 0, 240, 24, COL_DBG_HDR_BG);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(0xFFFF, COL_DBG_HDR_BG);
+    tft.setTextSize(2);
+    tft.drawString(g_calMode == CAL_VOLT ? "VOLTAGE CAL" : "CURRENT CAL", 120, 12);
+
+    tft.setTextSize(1);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(COL_LABEL, COL_BG);
+
+    char buf[40];
+    uint8_t nSteps = (g_calMode == CAL_CURR) ? kCalCurrNPts : 2;
+    snprintf(buf, sizeof(buf), "STEP %d OF %d", g_calStep + 1, nSteps);
+    tft.drawString(buf, 4, 30);
+
+    if (g_calMode == CAL_CURR) {
+        snprintf(buf, sizeof(buf), "Set: %.1f A  (load ON)", kCalCurrSetPt[g_calStep]);
+        tft.drawString(buf, 4, 50);
+    } else {
+        tft.drawString("Connect supply voltage.", 4, 50);
+    }
+    tft.drawString("ADC reads:", 4, 70);
+    tft.drawString("Enter value from external meter:", 4, 110);
+    hline(160);
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.drawString("L/R: select digit", 4, 210);
+    tft.drawString("ENC: change value", 4, 222);
+    tft.drawString("BUTTON: confirm  DBG: cancel", 4, 234);
+
+    drawCalInput();
+}
+
+static void updateCalScreen() {
+    char buf[24];
+    spr.createSprite(120, 10);
+    spr.fillSprite(COL_BG);
+    spr.setTextDatum(TL_DATUM);
+    spr.setTextSize(1);
+    if (g_calMode == CAL_CURR) {
+        snprintf(buf, sizeof(buf), "%.3f A", measA);
+        spr.setTextColor(COL_CURR, COL_BG);
+    } else {
+        snprintf(buf, sizeof(buf), "%.2f V", measV);
+        spr.setTextColor(COL_VOLT, COL_BG);
+    }
+    spr.drawString(buf, 0, 0);
+    spr.pushSprite(4, 82);
+    spr.deleteSprite();
+    drawCalInput();
+}
+
+static void enterCalibration(CalMode mode) {
+    g_calMode    = mode;
+    g_calStep    = 0;
+    g_calCursor  = 1;  // start on ones digit
+    g_debugScreen = false;
+
+    if (mode == CAL_CURR) {
+        g_calSavedLoad = g_loadOn;
+        g_calSavedSetA = setA;
+        g_loadOn = true;
+        digitalWrite(PIN_DOUT_13, LOW);  // load on (active-low)
+        // Drive DAC directly with nominal setpoint — bypass any existing cal
+        dac80501SetVoltage(kCalCurrSetPt[0] / 100.0f * 2.5f);
+        g_calUserVal = kCalCurrSetPt[0];
+    } else {
+        g_calUserVal = (measV > 0.1f) ? measV : 5.0f;
+    }
+    drawCalFrame();
+}
+
+static void cancelCalibration() {
+    if (g_calMode == CAL_CURR) {
+        setA     = g_calSavedSetA;
+        g_loadOn = g_calSavedLoad;
+        if (!g_loadOn) { dac80501SetVoltage(0); digitalWrite(PIN_DOUT_13, HIGH); }
+        else            { applySetCurrent(); }
+    }
+    g_calMode     = CAL_NONE;
+    g_debugScreen = true;
+    g_dbgMenuSel  = -1;
+    drawDebugFrame();
+    updateDebugValues();
+}
+
+static void drawCalViewFrame() {
+    tft.fillScreen(COL_BG);
+    tft.fillRect(0, 0, 240, 24, COL_DBG_HDR_BG);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(0xFFFF, COL_DBG_HDR_BG);
+    tft.setTextSize(2);
+    tft.drawString("CAL VALUES", 120, 12);
+
+    tft.setTextSize(1);
+    tft.setTextDatum(TL_DATUM);
+
+    // Column layout (6 px/char, textSize 1):
+    //   "  %6.3f  %6.3f  %+7.3f"  ≈ 162 px — fits in 240 px
+    char buf[40];
+    int y = 28;
+
+    // ── ADC (measured) ───────────────────────────────────────────────────────
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.drawString("ADC  (measured)", 4, y); y += 10;
+    hline(y); y += 3;
+
+    // Voltage
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.drawString(g_calVCal ? "Voltage (2 pts):" : "Voltage: not calibrated", 4, y); y += 9;
+    if (g_calVCal) {
+        tft.drawString("  raw(V)  user(V)   err(V)", 4, y); y += 9;
+        for (uint8_t i = 0; i < 2; i++) {
+            float err = g_calPtsUserV[i] - g_calPtsRawV[i];
+            snprintf(buf, sizeof(buf), "  %6.3f  %6.3f  %+7.3f", g_calPtsRawV[i], g_calPtsUserV[i], err);
+            tft.setTextColor(COL_VOLT, COL_BG);
+            tft.drawString(buf, 4, y); y += 9;
+        }
+    }
+
+    // Current ADC
+    y += 2;
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.drawString(g_calACal ? "Current (5 pts):" : "Current: not calibrated", 4, y); y += 9;
+    if (g_calACal) {
+        tft.setTextColor(COL_LABEL, COL_BG);
+        tft.drawString("  raw(A)  user(A)   err(A)", 4, y); y += 9;
+        for (uint8_t i = 0; i < kCalCurrNPts; i++) {
+            float err = g_calPtsUserA[i] - g_calPtsRawA[i];
+            snprintf(buf, sizeof(buf), "  %6.3f  %6.3f  %+7.3f", g_calPtsRawA[i], g_calPtsUserA[i], err);
+            tft.setTextColor(COL_CURR, COL_BG);
+            tft.drawString(buf, 4, y); y += 9;
+        }
+    }
+
+    // ── DAC (set point) ──────────────────────────────────────────────────────
+    y += 2; hline(y); y += 3;
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.drawString("DAC  (set point)", 4, y); y += 10;
+    hline(y); y += 3;
+
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.drawString(g_calACal ? "Current (5 pts):" : "Current: not calibrated", 4, y); y += 9;
+    if (g_calACal) {
+        tft.setTextColor(COL_LABEL, COL_BG);
+        tft.drawString("  set(A)  user(A)   err(A)", 4, y); y += 9;
+        for (uint8_t i = 0; i < kCalCurrNPts; i++) {
+            float err = g_calPtsUserA[i] - kCalCurrSetPt[i];
+            snprintf(buf, sizeof(buf), "  %6.3f  %6.3f  %+7.3f", kCalCurrSetPt[i], g_calPtsUserA[i], err);
+            tft.setTextColor(COL_SET, COL_BG);
+            tft.drawString(buf, 4, y); y += 9;
+        }
+    }
+
+    y += 2; hline(y); y += 3;
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.drawString("BUTTON / DBG: back", 4, y);
+}
+
+static void handleCalConfirm() {
+    // Capture the uncalibrated raw ADC value at this step
+    g_calRaw[g_calStep]  = (g_calMode == CAL_CURR) ? g_rawA : g_rawV;
+    g_calUser[g_calStep] = g_calUserVal;
+
+    uint8_t lastStep = (g_calMode == CAL_CURR) ? kCalCurrNPts - 1 : 1;
+
+    if (g_calStep < lastStep) {
+        g_calStep++;
+        g_calCursor = 1;
+        if (g_calMode == CAL_CURR) {
+            dac80501SetVoltage(kCalCurrSetPt[g_calStep] / 100.0f * 2.5f);
+            g_calUserVal = kCalCurrSetPt[g_calStep];
+        } else {
+            g_calUserVal = measV;  // hint for second voltage point
+        }
+        drawCalFrame();
+    } else {
+        // All points collected — copy into permanent calibration tables
+        if (g_calMode == CAL_VOLT) {
+            g_calPtsRawV[0]  = g_calRaw[0];  g_calPtsUserV[0] = g_calUser[0];
+            g_calPtsRawV[1]  = g_calRaw[1];  g_calPtsUserV[1] = g_calUser[1];
+            g_calVCal = true;
+        } else {
+            for (uint8_t i = 0; i < kCalCurrNPts; i++) {
+                g_calPtsRawA[i]  = g_calRaw[i];
+                g_calPtsUserA[i] = g_calUser[i];
+            }
+            g_calACal = true;
+        }
+        saveCalParams();
+
+        // Restore load state and return to debug screen
+        if (g_calMode == CAL_CURR) {
+            setA     = g_calSavedSetA;
+            g_loadOn = g_calSavedLoad;
+            if (!g_loadOn) { dac80501SetVoltage(0); digitalWrite(PIN_DOUT_13, HIGH); }
+            else            { applySetCurrent(); }
+        }
+        g_calMode     = CAL_NONE;
+        g_debugScreen = true;
+        g_dbgMenuSel  = -1;
+        drawDebugFrame();
+        updateDebugValues();
+    }
 }
 
 // ── Input handling ────────────────────────────────────────────────────────────
@@ -525,7 +906,29 @@ static void handleInputs() {
         uint8_t prevAB = (g_prevState >> 1) & 0x03;
         uint8_t newAB  = (state >> 1) & 0x03;
         acc += enc[(prevAB << 2) | newAB];
-        if (!g_debugScreen) {
+        if (g_calMode != CAL_NONE) {
+            if (acc <= -4) {
+                acc = 0;
+                g_calUserVal = constrain(g_calUserVal + kCalStep[g_calCursor], 0.0f, 99.999f);
+                drawCalInput();
+            } else if (acc >= 4) {
+                acc = 0;
+                g_calUserVal = constrain(g_calUserVal - kCalStep[g_calCursor], 0.0f, 99.999f);
+                drawCalInput();
+            }
+        } else if (g_debugScreen && g_dbgMenuSel == 4) {
+            if (acc <= -4) {
+                acc = 0;
+                g_otpTemp = constrain(g_otpTemp + 1.0f, 30.0f, 120.0f);
+                updateDebugValues();
+                saveOtpTemp();
+            } else if (acc >= 4) {
+                acc = 0;
+                g_otpTemp = constrain(g_otpTemp - 1.0f, 30.0f, 120.0f);
+                updateDebugValues();
+                saveOtpTemp();
+            }
+        } else if (!g_debugScreen) {
             if (acc <= -4) {
                 acc = 0;
                 if (g_editUVP) { setUVP = constrain(setUVP + kUVPStep[g_uvpCursorPos], 0.0f, 99.99f); drawSetUVP(); }
@@ -546,43 +949,103 @@ static void handleInputs() {
         if (!(btnChanged & (1u << i))) continue;
         bool low = !(state & (1u << i));
         if (!low) continue;  // act on press only
-        if (i == 0)  {                                                                // P00 = encoder push button
-            if (g_debugScreen) {
-                g_extIShunt = !g_extIShunt;
-                digitalWrite(PIN_DOUT_10, g_extIShunt ? HIGH : LOW);
-                EEPROM.write(EEPROM_ADDR_ISHUNT, g_extIShunt ? 0x01 : 0x00);
-                EEPROM.commit();
+        if (i == 0) {                                                                 // P0.0 = encoder push button
+            if (g_calMode != CAL_NONE) {
+                handleCalConfirm();
+            } else if (g_calViewScreen) {
+                g_calViewScreen = false;
+                g_debugScreen   = true;
+                g_dbgMenuSel    = 3;
+                drawDebugFrame();
                 updateDebugValues();
+            } else if (g_debugScreen) {
+                if (g_dbgMenuSel == 0) {
+                    g_extIShunt = !g_extIShunt;
+                    digitalWrite(PIN_DOUT_10, g_extIShunt ? HIGH : LOW);
+                    EEPROM.write(EEPROM_ADDR_ISHUNT, g_extIShunt ? 0x01 : 0x00);
+                    EEPROM.commit();
+                    updateDebugValues();
+                } else if (g_dbgMenuSel == 1) {
+                    enterCalibration(CAL_VOLT);
+                } else if (g_dbgMenuSel == 2) {
+                    enterCalibration(CAL_CURR);
+                } else if (g_dbgMenuSel == 3) {
+                    g_calViewScreen = true;
+                    g_debugScreen   = false;
+                    drawCalViewFrame();
+                }
             } else {
                 g_editUVP = !g_editUVP; drawSetCurrent(); drawSetUVP();
             }
         }
-        if (i == 3 && !g_debugScreen)  {                                              // P0.3 = left
-            if (g_editUVP) { if (g_uvpCursorPos > 0) { g_uvpCursorPos--; drawSetUVP(); } }
-            else           { if (g_cursorPos    > 0) { g_cursorPos--;    drawSetCurrent(); } }
+        if (i == 3) {                                                                 // P0.3 = left
+            if (g_calMode != CAL_NONE) {
+                if (g_calCursor > 0) { g_calCursor--; drawCalInput(); }
+            } else if (g_debugScreen) {
+                if (g_dbgMenuSel > -1) { g_dbgMenuSel--; updateDebugValues(); }
+            } else {
+                if (g_editUVP) { if (g_uvpCursorPos > 0) { g_uvpCursorPos--; drawSetUVP(); } }
+                else           { if (g_cursorPos    > 0) { g_cursorPos--;    drawSetCurrent(); } }
+            }
         }
-        if (i == 4 && !g_debugScreen)  {                                              // P0.4 = right
-            if (g_editUVP) { if (g_uvpCursorPos < 3) { g_uvpCursorPos++; drawSetUVP(); } }
-            else           { if (g_cursorPos    < 3) { g_cursorPos++;    drawSetCurrent(); } }
+        if (i == 4) {                                                                 // P0.4 = right
+            if (g_calMode != CAL_NONE) {
+                if (g_calCursor < (int8_t)(kCalNDigits - 1)) { g_calCursor++; drawCalInput(); }
+            } else if (g_debugScreen) {
+                if (g_dbgMenuSel < 4) { g_dbgMenuSel++; updateDebugValues(); }
+            } else {
+                if (g_editUVP) { if (g_uvpCursorPos < 3) { g_uvpCursorPos++; drawSetUVP(); } }
+                else           { if (g_cursorPos    < 3) { g_cursorPos++;    drawSetCurrent(); } }
+            }
         }
-        if (i == 5)  {                                                                // P0.5 = debug screen toggle
-            g_debugScreen = !g_debugScreen;
-            if (g_debugScreen) {
-                g_dacOk  = dac80501Verify();
-                g_adsOk  = ads1115Ping();
-                g_tcalOk = ioExp.ping();
+        if (i == 5) {                                                                 // P0.5 = debug screen toggle / cancel cal or view
+            if (g_calMode != CAL_NONE) {
+                cancelCalibration();
+            } else if (g_calViewScreen) {
+                g_calViewScreen = false;
+                g_debugScreen   = true;
+                g_dbgMenuSel    = 3;
                 drawDebugFrame();
                 updateDebugValues();
             } else {
-                drawFrame();
-                updateValues();
-                drawSetCurrent();
-                drawSetUVP();
+                g_debugScreen = !g_debugScreen;
+                if (g_debugScreen) {
+                    g_dbgMenuSel = -1;
+                    g_dacOk  = dac80501Verify();
+                    g_adsOk  = ads1115Ping();
+                    g_tcalOk = ioExp.ping();
+                    drawDebugFrame();
+                    updateDebugValues();
+                } else {
+                    drawFrame();
+                    updateValues();
+                    drawSetCurrent();
+                    drawSetUVP();
+                }
             }
         }
-        if (i == 6)  { g_timerStart = millis(); measAh = 0.0f; measWh = 0.0f; }                                 // P0.6 = timer + capacity reset
-        if (i == 7)  { g_extVSense = !g_extVSense; ioExp.writePin(9, g_extVSense); if (!g_debugScreen) drawVSenseIndicator(); }   // P7 = V-sense: P11(bit9) LOW=INT, HIGH=EXT
-        if (i == 8)  { g_loadOn = !g_loadOn; digitalWrite(PIN_DOUT_13, g_loadOn ? LOW : HIGH); if (g_loadOn) applySetCurrent(); else dac80501SetVoltage(0); drawHeader(); }  // P10 = on/off; GPIO13 active-low
+        if (i == 6 && g_calMode == CAL_NONE) { g_timerStart = millis(); measAh = 0.0f; measWh = 0.0f; }  // P0.6 = timer + capacity reset
+        if (i == 7 && g_calMode == CAL_NONE) { g_extVSense = !g_extVSense; ioExp.writePin(9, g_extVSense); if (!g_debugScreen) drawVSenseIndicator(); }  // P7 = V-sense
+        if (i == 8 && g_calMode == CAL_NONE && !g_otpTriggered) { g_loadOn = !g_loadOn; digitalWrite(PIN_DOUT_13, g_loadOn ? LOW : HIGH); if (g_loadOn) applySetCurrent(); else dac80501SetVoltage(0); drawHeader(); }  // P10 = on/off (blocked while OTP active)
+    }
+}
+
+// Non-blocking beep sequencer. Call every loop iteration.
+// When g_beepCount > 0 it drives the OTP alarm (5×500ms on / 100ms gap).
+// When idle it falls back to the continuous power-limit beep.
+static void updateBeeper(unsigned long now) {
+    if (g_beepCount > 0) {
+        if (now >= g_beepNext) {
+            g_beepPhase = !g_beepPhase;
+            digitalWrite(PIN_BEEPER, g_beepPhase ? HIGH : LOW);
+            if (!g_beepPhase) {
+                if (--g_beepCount > 0) g_beepNext = now + 100;  // 100 ms gap between beeps
+            } else {
+                g_beepNext = now + 500;  // 500 ms ON
+            }
+        }
+    } else {
+        digitalWrite(PIN_BEEPER, measW > 1000.0f ? HIGH : LOW);
     }
 }
 
@@ -604,6 +1067,7 @@ void setup() {
     analogWrite(PIN_DOUT_3, 0);   // fan 2 — off until temp control kicks in
     EEPROM.begin(EEPROM_SIZE);
     g_extIShunt = (EEPROM.read(EEPROM_ADDR_ISHUNT) == 0x01);
+    loadCalParams();
 
     pinMode(PIN_DOUT_8,  OUTPUT);
     pinMode(PIN_DOUT_9,  OUTPUT);
@@ -690,6 +1154,7 @@ void loop() {
     static unsigned long lastUpdate = 0;
     static unsigned long lastTempUpdate = 0;
     unsigned long now = millis();
+    updateBeeper(now);
 
     if (now - lastTempUpdate >= 1000) {
         lastTempUpdate = now;
@@ -699,8 +1164,23 @@ void loop() {
         float tMax = NAN;
         for (float ti : g_tempAll) if (!isnan(ti) && (isnan(tMax) || ti > tMax)) tMax = ti;
         if (!isnan(tMax)) tempC = tMax;
-        // off below 35°C, linear ramp to 100% at 55°C
-        g_fanPwm = (uint8_t)constrain((tempC - 35.0f) / 20.0f * 255.0f, 0.0f, 255.0f);
+        // OTP: shut load off and trigger alarm when threshold exceeded
+        if (!g_otpTriggered && !isnan(tempC) && tempC >= g_otpTemp) {
+            g_otpTriggered = true;
+            if (g_loadOn) {
+                g_loadOn = false;
+                digitalWrite(PIN_DOUT_13, HIGH);
+                dac80501SetVoltage(0);
+                if (!g_debugScreen && !g_calViewScreen && g_calMode == CAL_NONE) drawHeader();
+            }
+            g_beepCount = 5;
+            g_beepPhase = false;
+            g_beepNext  = now;
+        } else if (g_otpTriggered && tempC < g_otpTemp - 5.0f) {
+            g_otpTriggered = false;
+        }
+        // off below 30°C, linear ramp to 100% at 50°C
+        g_fanPwm = (uint8_t)constrain((tempC - 30.0f) / 20.0f * 255.0f, 0.0f, 255.0f);
         analogWrite(PIN_DOUT_2, g_fanPwm);
         analogWrite(PIN_DOUT_3, g_fanPwm);
         if (g_debugScreen) {
@@ -716,20 +1196,20 @@ void loop() {
         lastUpdate = now;
 
         float v = ads1115ReadVoltage();   // ~15.5 ms — one 64-SPS single-shot conversion period
-        if (!isnan(v)) measV = v;
+        if (!isnan(v)) { g_rawV = v; measV = g_calVCal ? piecewiseLerp(g_calPtsRawV, g_calPtsUserV, 2, v) : v; }
         handleInputs();
 
         float a = ads1115ReadCurrent();   // ~15.5 ms — same
-        if (!isnan(a)) measA = a;
+        if (!isnan(a)) { g_rawA = a; measA = g_calACal ? piecewiseLerp(g_calPtsRawA, g_calPtsUserA, kCalCurrNPts, a) : a; }
         handleInputs();
 
         measW = measV * measA;
-        digitalWrite(PIN_BEEPER, measW > 1000.0f ? HIGH : LOW);
         if (g_loadOn) {
             measAh += measA * dtH;
             measWh += measW * dtH;
         }
 
-        if (!g_debugScreen) updateValues();  // ~13.8 ms — 3 sprite groups pushed to TFT via SPI
+        if      (g_calMode != CAL_NONE) updateCalScreen();
+        else if (!g_debugScreen && !g_calViewScreen) updateValues();  // ~13.8 ms — 3 sprite groups pushed to TFT via SPI
     }
 }
