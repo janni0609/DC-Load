@@ -1087,7 +1087,7 @@ void setup() {
     Wire1.begin();
     Wire1.setClock(1000000);
 
-    delay(500);  // wait for devices to power up
+    delay(200);  // wait for devices to power up
 
 
 
