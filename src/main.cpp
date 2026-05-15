@@ -12,7 +12,10 @@
 //   43..58  voltage cal: 2×rawV + 2×userV (4 floats = 16 bytes)
 //   59      OTP valid marker (0xCA = valid)
 //   60..63  OTP threshold (1 float = 4 bytes)
-#define EEPROM_SIZE              64
+//   64      UVP PID valid marker (0xCA = valid)
+//   65..68  UVP Kp (1 float = 4 bytes)
+//   69..72  UVP Ki (1 float = 4 bytes)
+#define EEPROM_SIZE              80
 #define EEPROM_ADDR_ISHUNT        0
 #define EEPROM_ADDR_CAL_A_VALID   1
 #define EEPROM_ADDR_CAL_V_VALID   2
@@ -22,6 +25,9 @@
 #define EEPROM_ADDR_CAL_USER_V   51   // 2 floats (8 bytes)
 #define EEPROM_ADDR_OTP_VALID    59
 #define EEPROM_ADDR_OTP_TEMP     60
+#define EEPROM_ADDR_UVP_VALID    64
+#define EEPROM_ADDR_UVP_KP       65
+#define EEPROM_ADDR_UVP_KI       69
 
 // ── DAC80501 ─────────────────────────────────────────────────────────────────
 // Datasheet: SBAS794E (DAC80501/DAC70501/DAC60501)
@@ -246,6 +252,8 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define Y_DBG_CAL_A    192
 #define Y_DBG_CAL_VIEW 206
 #define Y_DBG_OTP      220
+#define Y_DBG_UVP_KP   234
+#define Y_DBG_UVP_KI   248
 
 // Dummy measurement values
 float measV   = 12.34f;
@@ -254,7 +262,7 @@ float measW   = 0.0f;
 float measAh  = 0.0f;
 float measWh  = 0.0f;
 float setA    = 6.000f;
-float setUVP  = 10.00f;
+float setUVP  = 0.00f;
 float tempC   = 42.5f;
 float g_tempAll[3]   = {NAN, NAN, NAN};
 bool    g_debugScreen  = false;
@@ -279,6 +287,12 @@ bool     g_otpTriggered   = false;   // true after OTP fires; clears when temp <
 uint8_t       g_beepCount = 0;       // OTP alarm: remaining beeps (0 = idle)
 bool          g_beepPhase = false;   // current beep phase: true = ON
 unsigned long g_beepNext  = 0;       // millis() of next beep state change
+
+// UVP constant-voltage control loop
+float    g_uvpKp       = 5.0f;    // proportional gain [A/V]
+float    g_uvpKi       = 0.2f;    // integral gain [A/(V·s)]
+float    g_uvpIntegral = 0.0f;    // integral accumulator
+bool     g_uvpActive   = false;   // true while CV regulation is active
 
 // Calibration UI (scratch space used during the calibration procedure)
 enum CalMode : uint8_t { CAL_NONE = 0, CAL_CURR = 1, CAL_VOLT = 2 };
@@ -322,6 +336,13 @@ static void applySetCurrent() {
     dac80501SetVoltage(constrain(nominal, 0.0f, 100.0f) / 100.0f * 2.5f);
 }
 
+static void applyCurrentDirect(float amps) {
+    float nominal = g_calACal
+        ? piecewiseLerp(g_calPtsUserA, kCalCurrSetPt, kCalCurrNPts, amps)
+        : amps;
+    dac80501SetVoltage(constrain(nominal, 0.0f, 100.0f) / 100.0f * 2.5f);
+}
+
 static void loadCalParams() {
     if (EEPROM.read(EEPROM_ADDR_CAL_A_VALID) == 0xCA) {
         for (uint8_t i = 0; i < kCalCurrNPts; i++) {
@@ -341,6 +362,19 @@ static void loadCalParams() {
         EEPROM.get(EEPROM_ADDR_OTP_TEMP, g_otpTemp);
         g_otpTemp = constrain(g_otpTemp, 30.0f, 120.0f);
     }
+    if (EEPROM.read(EEPROM_ADDR_UVP_VALID) == 0xCA) {
+        EEPROM.get(EEPROM_ADDR_UVP_KP, g_uvpKp);
+        EEPROM.get(EEPROM_ADDR_UVP_KI, g_uvpKi);
+        g_uvpKp = constrain(g_uvpKp, 0.0f, 100.0f);
+        g_uvpKi = constrain(g_uvpKi, 0.0f,  10.0f);
+    }
+}
+
+static void saveUvpParams() {
+    EEPROM.write(EEPROM_ADDR_UVP_VALID, 0xCA);
+    EEPROM.put(EEPROM_ADDR_UVP_KP, g_uvpKp);
+    EEPROM.put(EEPROM_ADDR_UVP_KI, g_uvpKi);
+    EEPROM.commit();
 }
 
 static void saveOtpTemp() {
@@ -463,6 +497,8 @@ void drawDebugFrame() {
     hline(Y_DBG_CAL_A    - 1);
     hline(Y_DBG_CAL_VIEW - 1);
     hline(Y_DBG_OTP      - 1);
+    hline(Y_DBG_UVP_KP   - 1);
+    hline(Y_DBG_UVP_KI   - 1);
 
     drawLabel("TEMP right",4, Y_DBG_T0    + 3, 1);
     drawLabel("TEMP left", 4, Y_DBG_T1    + 3, 1);
@@ -504,10 +540,10 @@ void updateDebugValues() {
     drawValue(buf, 236, Y_DBG_VRAW + 3, 90, 8, COL_VOLT, 1);
     snprintf(buf, sizeof(buf), "%.3fV  +-%.3f", g_rawA / ADS1115_I_SCALE, kPgaFsr[g_pgaA]);
     drawValue(buf, 236, Y_DBG_IRAW + 3, 90, 8, COL_CURR, 1);
-    // Selectable menu rows (I SENSE + calibration items + OTP)
-    const char* calLabels[5] = { "I SENSE", "VOLT CAL", "CURR CAL", "VIEW CAL", "OTP TRIP" };
-    const int   calY[5]      = { Y_DBG_ISENSE, Y_DBG_CAL_V, Y_DBG_CAL_A, Y_DBG_CAL_VIEW, Y_DBG_OTP };
-    for (int8_t s = 0; s < 5; s++) {
+    // Selectable menu rows (I SENSE + calibration items + OTP + UVP PID)
+    const char* calLabels[7] = { "I SENSE", "VOLT CAL", "CURR CAL", "VIEW CAL", "OTP TRIP", "UVP Kp", "UVP Ki" };
+    const int   calY[7]      = { Y_DBG_ISENSE, Y_DBG_CAL_V, Y_DBG_CAL_A, Y_DBG_CAL_VIEW, Y_DBG_OTP, Y_DBG_UVP_KP, Y_DBG_UVP_KI };
+    for (int8_t s = 0; s < 7; s++) {
         bool hl = (g_dbgMenuSel == s);
         tft.fillRect(0, calY[s], 240, 14, hl ? COL_SET : COL_BG);
         tft.setTextSize(1);
@@ -524,6 +560,14 @@ void updateDebugValues() {
             snprintf(buf, sizeof(buf), "%.0fC", g_otpTemp);
             badge    = buf;
             badgeCol = hl ? COL_BG : (g_otpTriggered ? COL_TEMP_HOT : COL_TEMP_OK);
+        } else if (s == 5) {
+            snprintf(buf, sizeof(buf), "%.2f", g_uvpKp);
+            badge    = buf;
+            badgeCol = hl ? COL_BG : COL_LABEL;
+        } else if (s == 6) {
+            snprintf(buf, sizeof(buf), "%.3f", g_uvpKi);
+            badge    = buf;
+            badgeCol = hl ? COL_BG : COL_LABEL;
         } else {
             badge    = (s == 1) ? (g_calVCal ? "CAL" : "---")
                      : (s == 2) ? (g_calACal ? "CAL" : "---")
@@ -573,13 +617,14 @@ void drawSetUVP() {
     const int x0 = 235 - 7 * 12;  // left edge of 7-char string
     const int y  = Y_SET + 22;
 
+    uint16_t uvpCol = g_uvpActive ? COL_TEMP_HOT : COL_SET;
     tft.setTextSize(2);
     tft.setTextDatum(TL_DATUM);
     for (uint8_t i = 0; i < 7; i++) {
         bool hl = g_editUVP && (i == kUVPChar[g_uvpCursorPos]);
         int  cx = x0 + i * 12;
-        tft.fillRect(cx, y, 12, 16, hl ? COL_SET : COL_BG);
-        tft.setTextColor(hl ? COL_BG : COL_SET, hl ? COL_SET : COL_BG);
+        tft.fillRect(cx, y, 12, 16, hl ? uvpCol : COL_BG);
+        tft.setTextColor(hl ? COL_BG : uvpCol, hl ? uvpCol : COL_BG);
         char cs[2] = {buf[i], '\0'};
         tft.drawString(cs, cx, y);
     }
@@ -928,6 +973,30 @@ static void handleInputs() {
                 updateDebugValues();
                 saveOtpTemp();
             }
+        } else if (g_debugScreen && g_dbgMenuSel == 5) {
+            if (acc <= -4) {
+                acc = 0;
+                g_uvpKp = constrain(g_uvpKp + 0.1f, 0.0f, 100.0f);
+                updateDebugValues();
+                saveUvpParams();
+            } else if (acc >= 4) {
+                acc = 0;
+                g_uvpKp = constrain(g_uvpKp - 0.1f, 0.0f, 100.0f);
+                updateDebugValues();
+                saveUvpParams();
+            }
+        } else if (g_debugScreen && g_dbgMenuSel == 6) {
+            if (acc <= -4) {
+                acc = 0;
+                g_uvpKi = constrain(g_uvpKi + 0.01f, 0.0f, 10.0f);
+                updateDebugValues();
+                saveUvpParams();
+            } else if (acc >= 4) {
+                acc = 0;
+                g_uvpKi = constrain(g_uvpKi - 0.01f, 0.0f, 10.0f);
+                updateDebugValues();
+                saveUvpParams();
+            }
         } else if (!g_debugScreen) {
             if (acc <= -4) {
                 acc = 0;
@@ -992,7 +1061,7 @@ static void handleInputs() {
             if (g_calMode != CAL_NONE) {
                 if (g_calCursor < (int8_t)(kCalNDigits - 1)) { g_calCursor++; drawCalInput(); }
             } else if (g_debugScreen) {
-                if (g_dbgMenuSel < 4) { g_dbgMenuSel++; updateDebugValues(); }
+                if (g_dbgMenuSel < 6) { g_dbgMenuSel++; updateDebugValues(); }
             } else {
                 if (g_editUVP) { if (g_uvpCursorPos < 3) { g_uvpCursorPos++; drawSetUVP(); } }
                 else           { if (g_cursorPos    < 3) { g_cursorPos++;    drawSetCurrent(); } }
@@ -1207,6 +1276,39 @@ void loop() {
         if (g_loadOn) {
             measAh += measA * dtH;
             measWh += measW * dtH;
+        }
+
+        // UVP constant-voltage control loop: reduce current to hold voltage at setUVP
+        if (g_loadOn && setUVP > 0.0f) {
+            float error = measV - setUVP;  // positive = above threshold, negative = below
+            bool wasActive = g_uvpActive;
+            if (!g_uvpActive && error < 0.0f) {
+                g_uvpActive   = true;
+                g_uvpIntegral = 0.0f;
+            }
+            if (g_uvpActive) {
+                // Anti-windup: integral only accumulates in the negative (reducing) direction
+                g_uvpIntegral = constrain(
+                    g_uvpIntegral + g_uvpKi * error * 0.1f,
+                    -setA, 0.0f);
+                float cv_current = setA + g_uvpKp * error + g_uvpIntegral;
+                applyCurrentDirect(constrain(cv_current, 0.0f, setA));
+                // Exit CV mode with 0.5V hysteresis to avoid chattering
+                if (error > 0.5f) {
+                    g_uvpActive   = false;
+                    g_uvpIntegral = 0.0f;
+                    applySetCurrent();
+                }
+            }
+            if (g_uvpActive != wasActive && !g_debugScreen && !g_calViewScreen && g_calMode == CAL_NONE) {
+                drawSetUVP();
+            }
+        } else if (g_uvpActive) {
+            // UVP disabled (setUVP==0) or load turned off — exit CV mode
+            g_uvpActive   = false;
+            g_uvpIntegral = 0.0f;
+            if (g_loadOn) applySetCurrent();
+            if (!g_debugScreen && !g_calViewScreen && g_calMode == CAL_NONE) drawSetUVP();
         }
 
         if      (g_calMode != CAL_NONE) updateCalScreen();
