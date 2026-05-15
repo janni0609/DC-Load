@@ -9,25 +9,25 @@
 //   1       current cal valid marker (0xCA = valid)
 //   2       voltage cal valid marker (0xCA = valid)
 //   3..42   current cal: 5×rawA + 5×userA (10 floats = 40 bytes)
-//   43..58  voltage cal: 2×rawV + 2×userV (4 floats = 16 bytes)
-//   59      OTP valid marker (0xCA = valid)
-//   60..63  OTP threshold (1 float = 4 bytes)
-//   64      UVP PID valid marker (0xCA = valid)
-//   65..68  UVP Kp (1 float = 4 bytes)
-//   69..72  UVP Ki (1 float = 4 bytes)
-#define EEPROM_SIZE              80
+//   43..74  voltage cal: 4×rawV + 4×userV (8 floats = 32 bytes)
+//   75      OTP valid marker (0xCA = valid)
+//   76..79  OTP threshold (1 float = 4 bytes)
+//   80      UVP PID valid marker (0xCA = valid)
+//   81..84  UVP Kp (1 float = 4 bytes)
+//   85..88  UVP Ki (1 float = 4 bytes)
+#define EEPROM_SIZE              96
 #define EEPROM_ADDR_ISHUNT        0
 #define EEPROM_ADDR_CAL_A_VALID   1
 #define EEPROM_ADDR_CAL_V_VALID   2
 #define EEPROM_ADDR_CAL_RAW_A     3   // 5 floats (20 bytes)
 #define EEPROM_ADDR_CAL_USER_A   23   // 5 floats (20 bytes)
-#define EEPROM_ADDR_CAL_RAW_V    43   // 2 floats (8 bytes)
-#define EEPROM_ADDR_CAL_USER_V   51   // 2 floats (8 bytes)
-#define EEPROM_ADDR_OTP_VALID    59
-#define EEPROM_ADDR_OTP_TEMP     60
-#define EEPROM_ADDR_UVP_VALID    64
-#define EEPROM_ADDR_UVP_KP       65
-#define EEPROM_ADDR_UVP_KI       69
+#define EEPROM_ADDR_CAL_RAW_V    43   // 4 floats (16 bytes)
+#define EEPROM_ADDR_CAL_USER_V   59   // 4 floats (16 bytes)
+#define EEPROM_ADDR_OTP_VALID    75
+#define EEPROM_ADDR_OTP_TEMP     76
+#define EEPROM_ADDR_UVP_VALID    80
+#define EEPROM_ADDR_UVP_KP       81
+#define EEPROM_ADDR_UVP_KI       85
 
 // ── DAC80501 ─────────────────────────────────────────────────────────────────
 // Datasheet: SBAS794E (DAC80501/DAC70501/DAC60501)
@@ -173,6 +173,8 @@ static void dac80501SetVoltage(float v) {
 #define PIN_DOUT_13 13
 #define PIN_BEEPER  22
 
+#define BTN_DEBOUNCE_MS 50
+
 // Analog inputs (ADC0–ADC2 on RP2040)
 #define PIN_ADC0    26
 #define PIN_ADC1    27
@@ -277,8 +279,8 @@ float g_rawA = 0.0f;   // last raw ads1115ReadCurrent() result (uncalibrated)
 // Piecewise-linear calibration tables (loaded from EEPROM; identity by default)
 float    g_calPtsRawA[5]  = { 0.0f, 0.5f,  2.0f, 10.0f, 60.0f };
 float    g_calPtsUserA[5] = { 0.0f, 0.5f,  2.0f, 10.0f, 60.0f };
-float    g_calPtsRawV[2]  = { 5.0f, 50.0f };
-float    g_calPtsUserV[2] = { 5.0f, 50.0f };
+float    g_calPtsRawV[4]  = { 5.0f, 20.0f, 50.0f, 80.0f };
+float    g_calPtsUserV[4] = { 5.0f, 20.0f, 50.0f, 80.0f };
 bool     g_calACal        = false;   // true when a valid current cal is stored
 bool     g_calVCal        = false;   // true when a valid voltage cal is stored
 float    g_otpTemp        = 70.0f;   // over-temp protection threshold [°C]
@@ -309,6 +311,7 @@ int8_t   g_dbgMenuSel    = -1;     // -1=none, 0=VOLT CAL, 1=CURR CAL, 2=VIEW CA
 
 static const float   kCalCurrSetPt[]  = { 0.0f, 0.5f, 2.0f, 10.0f, 60.0f };
 static const uint8_t kCalCurrNPts     = 5;
+static const uint8_t kCalVoltNPts     = 4;
 static const float   kCalStep[]       = { 10.0f, 1.0f, 0.1f, 0.01f, 0.001f };
 static const uint8_t kCalNDigits      = 5;
 static const uint8_t kCalCharIdx[]    = { 0, 1, 3, 4, 5 };
@@ -352,7 +355,7 @@ static void loadCalParams() {
         g_calACal = true;
     }
     if (EEPROM.read(EEPROM_ADDR_CAL_V_VALID) == 0xCA) {
-        for (uint8_t i = 0; i < 2; i++) {
+        for (uint8_t i = 0; i < kCalVoltNPts; i++) {
             EEPROM.get(EEPROM_ADDR_CAL_RAW_V  + i * 4, g_calPtsRawV[i]);
             EEPROM.get(EEPROM_ADDR_CAL_USER_V + i * 4, g_calPtsUserV[i]);
         }
@@ -388,7 +391,7 @@ static void saveCalParams() {
         EEPROM.put(EEPROM_ADDR_CAL_RAW_A  + i * 4, g_calPtsRawA[i]);
         EEPROM.put(EEPROM_ADDR_CAL_USER_A + i * 4, g_calPtsUserA[i]);
     }
-    for (uint8_t i = 0; i < 2; i++) {
+    for (uint8_t i = 0; i < kCalVoltNPts; i++) {
         EEPROM.put(EEPROM_ADDR_CAL_RAW_V  + i * 4, g_calPtsRawV[i]);
         EEPROM.put(EEPROM_ADDR_CAL_USER_V + i * 4, g_calPtsUserV[i]);
     }
@@ -741,7 +744,7 @@ static void drawCalFrame() {
     tft.setTextColor(COL_LABEL, COL_BG);
 
     char buf[40];
-    uint8_t nSteps = (g_calMode == CAL_CURR) ? kCalCurrNPts : 2;
+    uint8_t nSteps = (g_calMode == CAL_CURR) ? kCalCurrNPts : kCalVoltNPts;
     snprintf(buf, sizeof(buf), "STEP %d OF %d", g_calStep + 1, nSteps);
     tft.drawString(buf, 4, 30);
 
@@ -838,10 +841,10 @@ static void drawCalViewFrame() {
 
     // Voltage
     tft.setTextColor(COL_LABEL, COL_BG);
-    tft.drawString(g_calVCal ? "Voltage (2 pts):" : "Voltage: not calibrated", 4, y); y += 9;
+    tft.drawString(g_calVCal ? "Voltage (4 pts):" : "Voltage: not calibrated", 4, y); y += 9;
     if (g_calVCal) {
         tft.drawString("  raw(V)  user(V)   err(V)", 4, y); y += 9;
-        for (uint8_t i = 0; i < 2; i++) {
+        for (uint8_t i = 0; i < kCalVoltNPts; i++) {
             float err = g_calPtsUserV[i] - g_calPtsRawV[i];
             snprintf(buf, sizeof(buf), "  %6.3f  %6.3f  %+7.3f", g_calPtsRawV[i], g_calPtsUserV[i], err);
             tft.setTextColor(COL_VOLT, COL_BG);
@@ -893,7 +896,7 @@ static void handleCalConfirm() {
     g_calRaw[g_calStep]  = (g_calMode == CAL_CURR) ? g_rawA : g_rawV;
     g_calUser[g_calStep] = g_calUserVal;
 
-    uint8_t lastStep = (g_calMode == CAL_CURR) ? kCalCurrNPts - 1 : 1;
+    uint8_t lastStep = (g_calMode == CAL_CURR) ? kCalCurrNPts - 1 : kCalVoltNPts - 1;
 
     if (g_calStep < lastStep) {
         g_calStep++;
@@ -908,8 +911,10 @@ static void handleCalConfirm() {
     } else {
         // All points collected — copy into permanent calibration tables
         if (g_calMode == CAL_VOLT) {
-            g_calPtsRawV[0]  = g_calRaw[0];  g_calPtsUserV[0] = g_calUser[0];
-            g_calPtsRawV[1]  = g_calRaw[1];  g_calPtsUserV[1] = g_calUser[1];
+            for (uint8_t i = 0; i < kCalVoltNPts; i++) {
+                g_calPtsRawV[i]  = g_calRaw[i];
+                g_calPtsUserV[i] = g_calUser[i];
+            }
             g_calVCal = true;
         } else {
             for (uint8_t i = 0; i < kCalCurrNPts; i++) {
@@ -1013,11 +1018,15 @@ static void handleInputs() {
     g_prevState = state;
 
     // Buttons — all pins except the encoder (P0.1 and P0.2)
+    static unsigned long btnLastPress[11] = {};
+    unsigned long btnNow = millis();
     uint16_t btnChanged = changed & ~0x06u;
     for (uint8_t i = 0; i < 11; i++) {
         if (!(btnChanged & (1u << i))) continue;
         bool low = !(state & (1u << i));
         if (!low) continue;  // act on press only
+        if (btnNow - btnLastPress[i] < BTN_DEBOUNCE_MS) continue;
+        btnLastPress[i] = btnNow;
         if (i == 0) {                                                                 // P0.0 = encoder push button
             if (g_calMode != CAL_NONE) {
                 handleCalConfirm();
@@ -1265,7 +1274,7 @@ void loop() {
         lastUpdate = now;
 
         float v = ads1115ReadVoltage();   // ~15.5 ms — one 64-SPS single-shot conversion period
-        if (!isnan(v)) { g_rawV = v; measV = g_calVCal ? piecewiseLerp(g_calPtsRawV, g_calPtsUserV, 2, v) : v; }
+        if (!isnan(v)) { g_rawV = v; measV = g_calVCal ? piecewiseLerp(g_calPtsRawV, g_calPtsUserV, kCalVoltNPts, v) : v; }
         handleInputs();
 
         float a = ads1115ReadCurrent();   // ~15.5 ms — same
