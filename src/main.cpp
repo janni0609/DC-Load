@@ -76,11 +76,11 @@ static bool dac80501Verify() {
 #define ADS1115_REG_CONFIG  0x01
 
 // Base config words with PGA field zeroed; OR with (pga_idx << 9) at runtime.
-// Single-shot, 64 SPS (DR=011b), comparator disabled (COMP_QUE=11b).
-// Voltage: AIN0–AIN1 (MUX=000) → high=0x81, low=0x63
-#define ADS1115_BASE_VOLT   0x8163
-// Current: AIN2–AIN3 (MUX=011) → high=0xB1, low=0x63
-#define ADS1115_BASE_CURR   0xB163
+// Single-shot, 128 SPS (DR=100b), comparator disabled (COMP_QUE=11b).
+// Voltage: AIN0–AIN1 (MUX=000) → high=0x81, low=0x83
+#define ADS1115_BASE_VOLT   0x8183
+// Current: AIN2–AIN3 (MUX=011) → high=0xB1, low=0x83
+#define ADS1115_BASE_CURR   0xB183
 
 // 2.5 V on AIN0-AIN1 = 100 V on load input
 #define ADS1115_V_SCALE     40.0f
@@ -121,7 +121,7 @@ static bool ads1115Verify() {
 }
 
 // Triggers a single-shot conversion with auto-ranging PGA.
-// Returns NAN on I2C error. Blocks ~16 ms (one 64-SPS cycle).
+// Returns NAN on I2C error. Blocks ~8 ms (one 128-SPS cycle).
 // Thresholds: >87.5 % FS → lower gain; <43.75 % FS → higher gain (hysteresis gap prevents oscillation).
 static float ads1115ReadChannel(uint16_t base_cfg, uint8_t &pga, float scale) {
     uint16_t cfg_word = base_cfg | ((uint16_t)pga << 9);
@@ -200,7 +200,8 @@ bool          g_extVSense    = false;  // false = internal V-sense, true = exter
 bool          g_extIShunt    = false;  // false = internal current sense (GPIO10 LOW), true = external shunt (GPIO10 HIGH)
 bool          g_editUVP      = false;  // false = editing set current, true = editing UVP
 int8_t        g_uvpCursorPos = 1;      // 0=tens 1=ones 2=tenths 3=hundredths
-unsigned long g_timerStart   = 0;      // millis() snapshot for elapsed timer; reset via P0.6
+unsigned long g_timerElapsed  = 0;     // accumulated on-time [ms]; pauses while load is off
+unsigned long g_timerSegStart = 0;     // millis() when the current on-segment started
 
 TFT_eSPI    tft = TFT_eSPI();
 TFT_eSprite spr = TFT_eSprite(&tft);
@@ -249,13 +250,14 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define Y_DBG_FAN  122
 #define Y_DBG_VRAW   136
 #define Y_DBG_IRAW   150
-#define Y_DBG_ISENSE 164
-#define Y_DBG_CAL_V    178
-#define Y_DBG_CAL_A    192
-#define Y_DBG_CAL_VIEW 206
-#define Y_DBG_OTP      220
-#define Y_DBG_UVP_KP   234
-#define Y_DBG_UVP_KI   248
+#define Y_DBG_ISENSE   164
+#define Y_DBG_VSENSE   178
+#define Y_DBG_CAL_V    192
+#define Y_DBG_CAL_A    206
+#define Y_DBG_CAL_VIEW 220
+#define Y_DBG_OTP      234
+#define Y_DBG_UVP_KP   248
+#define Y_DBG_UVP_KI   262
 
 // Dummy measurement values
 float measV   = 12.34f;
@@ -308,6 +310,24 @@ bool     g_calSavedLoad  = false;
 float    g_calSavedSetA  = 0.0f;
 bool     g_calViewScreen = false;
 int8_t   g_dbgMenuSel    = -1;     // -1=none, 0=VOLT CAL, 1=CURR CAL, 2=VIEW CAL
+
+enum AppMode : uint8_t { MODE_NORMAL = 0, MODE_ESR = 1 };
+static const char* kMenuLabels[] = { "NORMAL LOAD", "ESR MEASURE" };
+AppMode  g_appMode  = MODE_NORMAL;
+bool     g_menuOpen = false;
+uint8_t  g_menuSel  = 0;
+
+float    g_esrImax      = 0.0f;   // ESR I max setpoint [A]
+float    g_esrImin      = 0.0f;   // ESR I min setpoint [A]
+bool     g_esrEditMin   = false;  // false=cursor on I max, true=cursor on I min
+int8_t   g_esrCursorMax = 3;      // cursor digit for I max (0=hundreds … 3=tenths)
+int8_t   g_esrCursorMin = 3;      // cursor digit for I min
+uint8_t  g_esrStep      = 0;              // ESR cycle step 0-9
+float    g_esrSumV[2]   = {0.0f, 0.0f};  // V accumulator [0=Imax phase, 1=Imin phase]
+float    g_esrSumI[2]   = {0.0f, 0.0f};  // I accumulator
+float    g_esrDeltaV    = NAN;            // last Vmax - Vmin
+float    g_esrDeltaI    = NAN;            // last Imax_meas - Imin_meas
+float    g_esrResult    = NAN;            // last ESR [Ohm]
 
 static const float   kCalCurrSetPt[]  = { 0.0f, 0.5f, 2.0f, 10.0f, 60.0f };
 static const uint8_t kCalCurrNPts     = 5;
@@ -496,6 +516,7 @@ void drawDebugFrame() {
     hline(Y_DBG_VRAW   - 1);
     hline(Y_DBG_IRAW   - 1);
     hline(Y_DBG_ISENSE - 1);
+    hline(Y_DBG_VSENSE - 1);
     hline(Y_DBG_CAL_V    - 1);
     hline(Y_DBG_CAL_A    - 1);
     hline(Y_DBG_CAL_VIEW - 1);
@@ -543,12 +564,13 @@ void updateDebugValues() {
     drawValue(buf, 236, Y_DBG_VRAW + 3, 90, 8, COL_VOLT, 1);
     snprintf(buf, sizeof(buf), "%.3fV  +-%.3f", g_rawA / ADS1115_I_SCALE, kPgaFsr[g_pgaA]);
     drawValue(buf, 236, Y_DBG_IRAW + 3, 90, 8, COL_CURR, 1);
-    // Selectable menu rows (I SENSE + calibration items + OTP + UVP PID)
-    const char* calLabels[7] = { "I SENSE", "VOLT CAL", "CURR CAL", "VIEW CAL", "OTP TRIP", "UVP Kp", "UVP Ki" };
-    const int   calY[7]      = { Y_DBG_ISENSE, Y_DBG_CAL_V, Y_DBG_CAL_A, Y_DBG_CAL_VIEW, Y_DBG_OTP, Y_DBG_UVP_KP, Y_DBG_UVP_KI };
-    for (int8_t s = 0; s < 7; s++) {
+    // Selectable menu rows (I SENSE, V SENSE, calibration items, OTP, UVP PID)
+    const char* calLabels[8] = { "I SENSE", "V SENSE", "VOLT CAL", "CURR CAL", "VIEW CAL", "OTP TRIP", "UVP Kp", "UVP Ki" };
+    const int   calY[8]      = { Y_DBG_ISENSE, Y_DBG_VSENSE, Y_DBG_CAL_V, Y_DBG_CAL_A, Y_DBG_CAL_VIEW, Y_DBG_OTP, Y_DBG_UVP_KP, Y_DBG_UVP_KI };
+    for (int8_t s = 0; s < 8; s++) {
         bool hl = (g_dbgMenuSel == s);
         tft.fillRect(0, calY[s], 240, 14, hl ? COL_SET : COL_BG);
+        hline(calY[s] + 13);
         tft.setTextSize(1);
         tft.setTextDatum(TL_DATUM);
         tft.setTextColor(hl ? COL_BG : COL_LABEL, hl ? COL_SET : COL_BG);
@@ -559,21 +581,24 @@ void updateDebugValues() {
         if (s == 0) {
             badge    = g_extIShunt ? "EXT" : "INT";
             badgeCol = hl ? COL_BG : (g_extIShunt ? COL_VOLT : COL_LABEL);
-        } else if (s == 4) {
+        } else if (s == 1) {
+            badge    = g_extVSense ? "EXT" : "INT";
+            badgeCol = hl ? COL_BG : (g_extVSense ? COL_VOLT : COL_LABEL);
+        } else if (s == 5) {
             snprintf(buf, sizeof(buf), "%.0fC", g_otpTemp);
             badge    = buf;
             badgeCol = hl ? COL_BG : (g_otpTriggered ? COL_TEMP_HOT : COL_TEMP_OK);
-        } else if (s == 5) {
+        } else if (s == 6) {
             snprintf(buf, sizeof(buf), "%.2f", g_uvpKp);
             badge    = buf;
             badgeCol = hl ? COL_BG : COL_LABEL;
-        } else if (s == 6) {
+        } else if (s == 7) {
             snprintf(buf, sizeof(buf), "%.3f", g_uvpKi);
             badge    = buf;
             badgeCol = hl ? COL_BG : COL_LABEL;
         } else {
-            badge    = (s == 1) ? (g_calVCal ? "CAL" : "---")
-                     : (s == 2) ? (g_calACal ? "CAL" : "---")
+            badge    = (s == 2) ? (g_calVCal ? "CAL" : "---")
+                     : (s == 3) ? (g_calACal ? "CAL" : "---")
                      : "-->";
             badgeCol = hl ? COL_BG : COL_LABEL;
         }
@@ -694,7 +719,8 @@ void updateValues() {
     spr.setTextColor(tc, COL_BG);
     spr.drawString(buf, 62, 0);
 
-    unsigned long elapsed = (millis() - g_timerStart) / 1000UL;
+    unsigned long timerMs = g_timerElapsed + (g_loadOn ? millis() - g_timerSegStart : 0);
+    unsigned long elapsed = timerMs / 1000UL;
     snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu", elapsed / 3600, (elapsed % 3600) / 60, elapsed % 60);
     spr.setTextColor(COL_CAP, COL_BG);
     spr.drawString(buf, 182, 0);
@@ -793,6 +819,7 @@ static void enterCalibration(CalMode mode) {
     if (mode == CAL_CURR) {
         g_calSavedLoad = g_loadOn;
         g_calSavedSetA = setA;
+        if (!g_loadOn) g_timerSegStart = millis();
         g_loadOn = true;
         digitalWrite(PIN_DOUT_13, LOW);  // load on (active-low)
         // Drive DAC directly with nominal setpoint — bypass any existing cal
@@ -807,6 +834,7 @@ static void enterCalibration(CalMode mode) {
 static void cancelCalibration() {
     if (g_calMode == CAL_CURR) {
         setA     = g_calSavedSetA;
+        if (!g_calSavedLoad) g_timerElapsed += millis() - g_timerSegStart;
         g_loadOn = g_calSavedLoad;
         if (!g_loadOn) { dac80501SetVoltage(0); digitalWrite(PIN_DOUT_13, HIGH); }
         else            { applySetCurrent(); }
@@ -891,6 +919,164 @@ static void drawCalViewFrame() {
     tft.drawString("BUTTON / DBG: back", 4, y);
 }
 
+void drawMenuOverlay() {
+    const int16_t bx = 10, by = 110, bw = 220, bh = 100;
+    tft.fillRect(bx, by, bw, bh, COL_HDR_BG);
+    tft.fillRect(bx, by, bw, 28, COL_DBG_HDR_BG);
+    tft.drawRect(bx, by, bw, bh, COL_DIV);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(0xFFFF, COL_DBG_HDR_BG);
+    tft.setTextSize(2);
+    tft.drawString("SELECT MODE", 120, by + 14);
+    tft.drawFastHLine(bx, by + 28, bw, COL_DIV);
+    tft.drawFastVLine(bx + bw / 2, by + 28, bh - 28, COL_DIV);
+    for (uint8_t idx = 0; idx < 2; idx++) {
+        bool hl = (idx == g_menuSel);
+        int16_t cx = bx + bw / 4 + idx * (bw / 2);
+        int16_t iy = by + 31;
+        int16_t iw = bw / 2 - 4;
+        int16_t ih = bh - 34;
+        int16_t ix = bx + 2 + idx * (bw / 2);
+        tft.fillRect(ix, iy, iw, ih, hl ? COL_SET : COL_BG);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextSize(2);
+        tft.setTextColor(hl ? COL_BG : COL_LABEL, hl ? COL_SET : COL_BG);
+        tft.drawString(idx == 0 ? "NORMAL" : "ESR", cx, iy + 22);
+        tft.setTextSize(1);
+        tft.drawString(idx == 0 ? "LOAD" : "MEASURE", cx, iy + 50);
+    }
+}
+
+// Digit-cursor editors for I max and I min — same style as drawSetCurrent/drawSetUVP.
+// I max: right-aligned at x=115 (left half).  I min: right-aligned at x=235 (right half).
+// Both sit at y=209 inside the I MAX/I MIN section (y=187-226).
+static void drawEsrImax() {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%5.1f A", g_esrImax);
+    const int x0 = 115 - 7 * 12;
+    const int y  = 209;
+    tft.setTextSize(2);
+    tft.setTextDatum(TL_DATUM);
+    for (uint8_t i = 0; i < 7; i++) {
+        bool hl = !g_esrEditMin && (i == kDigitChar[g_esrCursorMax]);
+        int cx = x0 + i * 12;
+        tft.fillRect(cx, y, 12, 16, hl ? COL_SET : COL_BG);
+        tft.setTextColor(hl ? COL_BG : COL_SET, hl ? COL_SET : COL_BG);
+        char cs[2] = {buf[i], '\0'};
+        tft.drawString(cs, cx, y);
+    }
+}
+
+static void drawEsrImin() {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%5.1f A", g_esrImin);
+    const int x0 = 235 - 7 * 12;
+    const int y  = 209;
+    tft.setTextSize(2);
+    tft.setTextDatum(TL_DATUM);
+    for (uint8_t i = 0; i < 7; i++) {
+        bool hl = g_esrEditMin && (i == kDigitChar[g_esrCursorMin]);
+        int cx = x0 + i * 12;
+        tft.fillRect(cx, y, 12, 16, hl ? COL_SET : COL_BG);
+        tft.setTextColor(hl ? COL_BG : COL_SET, hl ? COL_SET : COL_BG);
+        char cs[2] = {buf[i], '\0'};
+        tft.drawString(cs, cx, y);
+    }
+}
+
+void drawEsrFrame() {
+    tft.fillScreen(COL_BG);
+    drawHeader();
+
+    // Compact 2×2 grid: row 1 y=24-88, row 2 y=90-154
+    hline(89);
+    hline(155);
+    vline(119, 24, 131);
+    hline(Y_TEMP - 1);
+
+    drawLabel("VOLTAGE",  4,   28);
+    drawLabel("CURRENT", 123,  28);
+    drawLabel("POWER",    4,   93);
+    drawLabel("ESR",     123,  93);
+
+    // Delta V row (y=156-185): label only — value drawn by updateEsrValues()
+    drawLabel("DELTA V", 4, 163);
+    hline(186);
+
+    // I MAX / I MIN section (y=187-226): same layout as SET CURR / SET UVP
+    vline(119, 187, 40);
+    drawLabel("I MAX",   4,   191);
+    drawLabel("I MIN",  124,  191);
+    drawEsrImax();
+    drawEsrImin();
+
+    drawLabel("TEMP",    4,   Y_TEMP + 7);
+}
+
+void updateEsrValues() {
+    char buf[16];
+
+    // Four measurement values — one 115×20 sprite reused across all quadrants
+    spr.createSprite(115, 20);
+    spr.setTextDatum(TR_DATUM);
+    spr.setTextSize(2);
+
+    spr.fillSprite(COL_BG);
+    spr.setTextColor(COL_VOLT, COL_BG);
+    snprintf(buf, sizeof(buf), "%.2f V", measV);
+    spr.drawString(buf, 115, 2);
+    spr.pushSprite(1, 50);              // top-left
+
+    spr.fillSprite(COL_BG);
+    spr.setTextColor(COL_CURR, COL_BG);
+    snprintf(buf, sizeof(buf), "%.3f A", measA);
+    spr.drawString(buf, 115, 2);
+    spr.pushSprite(122, 50);            // top-right
+
+    spr.fillSprite(COL_BG);
+    spr.setTextColor(COL_PWR, COL_BG);
+    snprintf(buf, sizeof(buf), "%.2f W", measW);
+    spr.drawString(buf, 115, 2);
+    spr.pushSprite(1, 115);             // bottom-left
+
+    spr.fillSprite(COL_BG);
+    spr.setTextColor(COL_CAP, COL_BG);
+    if (isnan(g_esrResult)) snprintf(buf, sizeof(buf), "--- R");
+    else                    snprintf(buf, sizeof(buf), "%.3f R", g_esrResult);
+    spr.drawString(buf, 115, 2);
+    spr.pushSprite(122, 115);           // bottom-right
+
+    spr.deleteSprite();
+
+    // Delta V — live result (sprite right-aligned at x=236, y=163)
+    spr.createSprite(90, 16);
+    spr.fillSprite(COL_BG);
+    spr.setTextDatum(TR_DATUM);
+    spr.setTextSize(2);
+    spr.setTextColor(COL_VOLT, COL_BG);
+    if (isnan(g_esrDeltaV)) spr.drawString("--- V", 90, 0);
+    else { snprintf(buf, sizeof(buf), "%.3f V", g_esrDeltaV); spr.drawString(buf, 90, 0); }
+    spr.pushSprite(146, 163);
+    spr.deleteSprite();
+
+    // Temperature
+    snprintf(buf, sizeof(buf), "%.1fC", tempC);
+    uint16_t tc = (tempC >= 60.0f) ? COL_TEMP_HOT : COL_TEMP_OK;
+    spr.createSprite(62, 16);
+    spr.fillSprite(COL_BG);
+    spr.setTextDatum(TR_DATUM);
+    spr.setTextSize(2);
+    spr.setTextColor(tc, COL_BG);
+    spr.drawString(buf, 62, 0);
+    spr.pushSprite(53, Y_TEMP + 7);
+    spr.deleteSprite();
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextSize(2);
+    tft.setTextColor(g_otpTriggered ? COL_TEMP_HOT : COL_LABEL, COL_BG);
+    tft.drawString("TEMP", 4, Y_TEMP + 7);
+}
+
 static void handleCalConfirm() {
     // Capture the uncalibrated raw ADC value at this step
     g_calRaw[g_calStep]  = (g_calMode == CAL_CURR) ? g_rawA : g_rawV;
@@ -928,6 +1114,7 @@ static void handleCalConfirm() {
         // Restore load state and return to debug screen
         if (g_calMode == CAL_CURR) {
             setA     = g_calSavedSetA;
+            if (!g_calSavedLoad) g_timerElapsed += millis() - g_timerSegStart;
             g_loadOn = g_calSavedLoad;
             if (!g_loadOn) { dac80501SetVoltage(0); digitalWrite(PIN_DOUT_13, HIGH); }
             else            { applySetCurrent(); }
@@ -966,7 +1153,7 @@ static void handleInputs() {
                 g_calUserVal = constrain(g_calUserVal - kCalStep[g_calCursor], 0.0f, 99.999f);
                 drawCalInput();
             }
-        } else if (g_debugScreen && g_dbgMenuSel == 4) {
+        } else if (g_debugScreen && g_dbgMenuSel == 5) {
             if (acc <= -4) {
                 acc = 0;
                 g_otpTemp = constrain(g_otpTemp + 1.0f, 30.0f, 120.0f);
@@ -978,7 +1165,7 @@ static void handleInputs() {
                 updateDebugValues();
                 saveOtpTemp();
             }
-        } else if (g_debugScreen && g_dbgMenuSel == 5) {
+        } else if (g_debugScreen && g_dbgMenuSel == 6) {
             if (acc <= -4) {
                 acc = 0;
                 g_uvpKp = constrain(g_uvpKp + 0.1f, 0.0f, 100.0f);
@@ -990,19 +1177,19 @@ static void handleInputs() {
                 updateDebugValues();
                 saveUvpParams();
             }
-        } else if (g_debugScreen && g_dbgMenuSel == 6) {
+        } else if (g_debugScreen && g_dbgMenuSel == 7) {
             if (acc <= -4) {
                 acc = 0;
-                g_uvpKi = constrain(g_uvpKi + 0.01f, 0.0f, 10.0f);
+                g_uvpKi = constrain(g_uvpKi + 0.1f, 0.0f, 50.0f);
                 updateDebugValues();
                 saveUvpParams();
             } else if (acc >= 4) {
                 acc = 0;
-                g_uvpKi = constrain(g_uvpKi - 0.01f, 0.0f, 10.0f);
+                g_uvpKi = constrain(g_uvpKi - 0.1f, 0.0f, 50.0f);
                 updateDebugValues();
                 saveUvpParams();
             }
-        } else if (!g_debugScreen) {
+        } else if (!g_debugScreen && g_appMode == MODE_NORMAL) {
             if (acc <= -4) {
                 acc = 0;
                 if (g_editUVP) { setUVP = constrain(setUVP + kUVPStep[g_uvpCursorPos], 0.0f, 99.99f); drawSetUVP(); }
@@ -1011,6 +1198,16 @@ static void handleInputs() {
                 acc = 0;
                 if (g_editUVP) { setUVP = constrain(setUVP - kUVPStep[g_uvpCursorPos], 0.0f, 99.99f); drawSetUVP(); }
                 else           { setA   = constrain(setA   - kDigitStep[g_cursorPos],   0.0f, 100.0f); drawSetCurrent(); applySetCurrent(); }
+            }
+        } else if (!g_debugScreen && g_appMode == MODE_ESR) {
+            if (acc <= -4) {
+                acc = 0;
+                if (!g_esrEditMin) { g_esrImax = constrain(g_esrImax + kDigitStep[g_esrCursorMax], 0.0f, 100.0f); drawEsrImax(); }
+                else               { g_esrImin = constrain(g_esrImin + kDigitStep[g_esrCursorMin], 0.0f, 100.0f); drawEsrImin(); }
+            } else if (acc >= 4) {
+                acc = 0;
+                if (!g_esrEditMin) { g_esrImax = constrain(g_esrImax - kDigitStep[g_esrCursorMax], 0.0f, 100.0f); drawEsrImax(); }
+                else               { g_esrImin = constrain(g_esrImin - kDigitStep[g_esrCursorMin], 0.0f, 100.0f); drawEsrImin(); }
             }
         }
     }
@@ -1028,12 +1225,17 @@ static void handleInputs() {
         if (btnNow - btnLastPress[i] < BTN_DEBOUNCE_MS) continue;
         btnLastPress[i] = btnNow;
         if (i == 0) {                                                                 // P0.0 = encoder push button
-            if (g_calMode != CAL_NONE) {
+            if (g_menuOpen) {
+                g_menuOpen = false;
+                g_appMode = (AppMode)g_menuSel;
+                if (g_appMode == MODE_NORMAL) { drawFrame(); updateValues(); drawSetCurrent(); drawSetUVP(); }
+                else { drawEsrFrame(); updateEsrValues(); }
+            } else if (g_calMode != CAL_NONE) {
                 handleCalConfirm();
             } else if (g_calViewScreen) {
                 g_calViewScreen = false;
                 g_debugScreen   = true;
-                g_dbgMenuSel    = 3;
+                g_dbgMenuSel    = 4;
                 drawDebugFrame();
                 updateDebugValues();
             } else if (g_debugScreen) {
@@ -1044,36 +1246,52 @@ static void handleInputs() {
                     EEPROM.commit();
                     updateDebugValues();
                 } else if (g_dbgMenuSel == 1) {
-                    enterCalibration(CAL_VOLT);
+                    g_extVSense = !g_extVSense;
+                    ioExp.writePin(9, g_extVSense);
+                    updateDebugValues();
                 } else if (g_dbgMenuSel == 2) {
-                    enterCalibration(CAL_CURR);
+                    enterCalibration(CAL_VOLT);
                 } else if (g_dbgMenuSel == 3) {
+                    enterCalibration(CAL_CURR);
+                } else if (g_dbgMenuSel == 4) {
                     g_calViewScreen = true;
                     g_debugScreen   = false;
                     drawCalViewFrame();
                 }
-            } else {
+            } else if (g_appMode == MODE_NORMAL) {
                 g_editUVP = !g_editUVP; drawSetCurrent(); drawSetUVP();
+            } else if (g_appMode == MODE_ESR) {
+                g_esrEditMin = !g_esrEditMin; drawEsrImax(); drawEsrImin();
             }
         }
         if (i == 3) {                                                                 // P0.3 = left
-            if (g_calMode != CAL_NONE) {
+            if (g_menuOpen) {
+                if (g_menuSel > 0) { g_menuSel--; drawMenuOverlay(); }
+            } else if (g_calMode != CAL_NONE) {
                 if (g_calCursor > 0) { g_calCursor--; drawCalInput(); }
             } else if (g_debugScreen) {
                 if (g_dbgMenuSel > -1) { g_dbgMenuSel--; updateDebugValues(); }
-            } else {
+            } else if (g_appMode == MODE_NORMAL) {
                 if (g_editUVP) { if (g_uvpCursorPos > 0) { g_uvpCursorPos--; drawSetUVP(); } }
                 else           { if (g_cursorPos    > 0) { g_cursorPos--;    drawSetCurrent(); } }
+            } else if (g_appMode == MODE_ESR) {
+                if (!g_esrEditMin) { if (g_esrCursorMax > 0) { g_esrCursorMax--; drawEsrImax(); } }
+                else               { if (g_esrCursorMin > 0) { g_esrCursorMin--; drawEsrImin(); } }
             }
         }
         if (i == 4) {                                                                 // P0.4 = right
-            if (g_calMode != CAL_NONE) {
+            if (g_menuOpen) {
+                if (g_menuSel < 1) { g_menuSel++; drawMenuOverlay(); }
+            } else if (g_calMode != CAL_NONE) {
                 if (g_calCursor < (int8_t)(kCalNDigits - 1)) { g_calCursor++; drawCalInput(); }
             } else if (g_debugScreen) {
-                if (g_dbgMenuSel < 6) { g_dbgMenuSel++; updateDebugValues(); }
-            } else {
+                if (g_dbgMenuSel < 7) { g_dbgMenuSel++; updateDebugValues(); }
+            } else if (g_appMode == MODE_NORMAL) {
                 if (g_editUVP) { if (g_uvpCursorPos < 3) { g_uvpCursorPos++; drawSetUVP(); } }
                 else           { if (g_cursorPos    < 3) { g_cursorPos++;    drawSetCurrent(); } }
+            } else if (g_appMode == MODE_ESR) {
+                if (!g_esrEditMin) { if (g_esrCursorMax < 3) { g_esrCursorMax++; drawEsrImax(); } }
+                else               { if (g_esrCursorMin < 3) { g_esrCursorMin++; drawEsrImin(); } }
             }
         }
         if (i == 5) {                                                                 // P0.5 = debug screen toggle / cancel cal or view
@@ -1082,7 +1300,7 @@ static void handleInputs() {
             } else if (g_calViewScreen) {
                 g_calViewScreen = false;
                 g_debugScreen   = true;
-                g_dbgMenuSel    = 3;
+                g_dbgMenuSel    = 4;
                 drawDebugFrame();
                 updateDebugValues();
             } else {
@@ -1095,16 +1313,23 @@ static void handleInputs() {
                     drawDebugFrame();
                     updateDebugValues();
                 } else {
-                    drawFrame();
-                    updateValues();
-                    drawSetCurrent();
-                    drawSetUVP();
+                    if (g_appMode == MODE_NORMAL) { drawFrame(); updateValues(); drawSetCurrent(); drawSetUVP(); }
+                    else { drawEsrFrame(); updateEsrValues(); }
                 }
             }
         }
-        if (i == 6 && g_calMode == CAL_NONE) { g_timerStart = millis(); measAh = 0.0f; measWh = 0.0f; }  // P0.6 = timer + capacity reset
-        if (i == 7 && g_calMode == CAL_NONE) { g_extVSense = !g_extVSense; ioExp.writePin(9, g_extVSense); if (!g_debugScreen) drawVSenseIndicator(); }  // P7 = V-sense
-        if (i == 8 && g_calMode == CAL_NONE && !g_otpTriggered) { g_loadOn = !g_loadOn; digitalWrite(PIN_DOUT_13, g_loadOn ? LOW : HIGH); if (g_loadOn) applySetCurrent(); else dac80501SetVoltage(0); drawHeader(); }  // P10 = on/off (blocked while OTP active)
+        if (i == 6 && g_calMode == CAL_NONE) { g_timerElapsed = 0; if (g_loadOn) g_timerSegStart = millis(); measAh = 0.0f; measWh = 0.0f; }  // P0.6 = timer + capacity reset
+        if (i == 7 && g_calMode == CAL_NONE && !g_debugScreen && !g_calViewScreen) {  // P0.7 = mode selection menu
+            g_menuOpen = !g_menuOpen;
+            if (g_menuOpen) {
+                g_menuSel = (uint8_t)g_appMode;
+                drawMenuOverlay();
+            } else {
+                if (g_appMode == MODE_NORMAL) { drawFrame(); updateValues(); drawSetCurrent(); drawSetUVP(); }
+                else { drawEsrFrame(); updateEsrValues(); }
+            }
+        }
+        if (i == 8 && g_calMode == CAL_NONE && !g_otpTriggered) { g_loadOn = !g_loadOn; if (g_loadOn) g_timerSegStart = millis(); else g_timerElapsed += millis() - g_timerSegStart; digitalWrite(PIN_DOUT_13, g_loadOn ? LOW : HIGH); if (g_loadOn) { if (g_appMode == MODE_ESR) { g_esrStep = 0; applyCurrentDirect(g_esrImax); } else { applySetCurrent(); } } else { dac80501SetVoltage(0); } drawHeader(); }  // P10 = on/off (blocked while OTP active)
     }
 }
 
@@ -1125,6 +1350,46 @@ static void updateBeeper(unsigned long now) {
     } else {
         digitalWrite(PIN_BEEPER, measW > 1000.0f ? HIGH : LOW);
     }
+}
+
+// ── ESR measurement state machine ────────────────────────────────────────────
+// Called once per 100 ms loop iteration when g_appMode==MODE_ESR && g_loadOn.
+// Steps 0-9: step 0 switches to Imax, steps 1-4 accumulate Imax V/I,
+// step 5 switches to Imin, steps 6-9 accumulate Imin V/I and (at step 9)
+// compute delta V, delta I and ESR from the four-sample averages.
+static void esrTick() {
+    switch (g_esrStep) {
+        case 0:
+            applyCurrentDirect(g_esrImax);
+            g_esrSumV[0] = g_esrSumI[0] = 0.0f;
+            break;
+        case 1: case 2: case 3: case 4:
+            g_esrSumV[0] += measV;
+            g_esrSumI[0] += measA;
+            break;
+        case 5:
+            applyCurrentDirect(g_esrImin);
+            g_esrSumV[1] = g_esrSumI[1] = 0.0f;
+            break;
+        case 6: case 7: case 8:
+            g_esrSumV[1] += measV;
+            g_esrSumI[1] += measA;
+            break;
+        case 9:
+            g_esrSumV[1] += measV;
+            g_esrSumI[1] += measA;
+            {
+                float vImax = g_esrSumV[0] / 4.0f;   // avg V during Imax phase
+                float vImin = g_esrSumV[1] / 4.0f;   // avg V during Imin phase (higher)
+                float iMax  = g_esrSumI[0] / 4.0f;
+                float iMin  = g_esrSumI[1] / 4.0f;
+                g_esrDeltaV = vImin - vImax;          // V_max - V_min (positive)
+                g_esrDeltaI = iMax  - iMin;           // I_max - I_min (positive)
+                g_esrResult = (g_esrDeltaI > 0.001f) ? g_esrDeltaV / g_esrDeltaI : NAN;
+            }
+            break;
+    }
+    g_esrStep = (g_esrStep + 1) % 10;
 }
 
 // ── Arduino entry points ─────────────────────────────────────────────────────
@@ -1246,6 +1511,7 @@ void loop() {
         if (!g_otpTriggered && !isnan(tempC) && tempC >= g_otpTemp) {
             g_otpTriggered = true;
             if (g_loadOn) {
+                g_timerElapsed += millis() - g_timerSegStart;
                 g_loadOn = false;
                 digitalWrite(PIN_DOUT_13, HIGH);
                 dac80501SetVoltage(0);
@@ -1272,55 +1538,60 @@ void loop() {
     if (now - lastUpdate >= 100) {
         float dtH = (now - lastUpdate) / 3600000.0f;
         lastUpdate = now;
-
-        float v = ads1115ReadVoltage();   // ~15.5 ms — one 64-SPS single-shot conversion period
+        float v = ads1115ReadVoltage();   // ~8 ms — one 128-SPS single-shot conversion period
         if (!isnan(v)) { g_rawV = v; measV = g_calVCal ? piecewiseLerp(g_calPtsRawV, g_calPtsUserV, kCalVoltNPts, v) : v; }
         handleInputs();
 
-        float a = ads1115ReadCurrent();   // ~15.5 ms — same
+        float a = ads1115ReadCurrent();   // ~8 ms — same
         if (!isnan(a)) { g_rawA = a; measA = g_calACal ? piecewiseLerp(g_calPtsRawA, g_calPtsUserA, kCalCurrNPts, a) : a; }
         handleInputs();
 
         measW = measV * measA;
-        if (g_loadOn) {
+        if (g_loadOn && g_appMode == MODE_NORMAL) {
             measAh += measA * dtH;
             measWh += measW * dtH;
         }
+        if (g_appMode == MODE_ESR && g_loadOn) esrTick();
 
-        // UVP constant-voltage control loop: reduce current to hold voltage at setUVP
-        if (g_loadOn && setUVP > 0.0f) {
-            float error = measV - setUVP;  // positive = above threshold, negative = below
-            bool wasActive = g_uvpActive;
-            if (!g_uvpActive && error < 0.0f) {
-                g_uvpActive   = true;
-                g_uvpIntegral = 0.0f;
-            }
-            if (g_uvpActive) {
-                // Anti-windup: integral only accumulates in the negative (reducing) direction
-                g_uvpIntegral = constrain(
-                    g_uvpIntegral + g_uvpKi * error * 0.1f,
-                    -setA, 0.0f);
-                float cv_current = setA + g_uvpKp * error + g_uvpIntegral;
-                applyCurrentDirect(constrain(cv_current, 0.0f, setA));
-                // Exit CV mode with 0.5V hysteresis to avoid chattering
-                if (error > 0.5f) {
-                    g_uvpActive   = false;
+        // UVP constant-voltage control loop — normal mode only
+        if (g_appMode == MODE_NORMAL) {
+            if (g_loadOn && setUVP > 0.0f) {
+                float error = measV - setUVP;  // positive = above threshold, negative = below
+                bool wasActive = g_uvpActive;
+                if (!g_uvpActive && error < 0.0f) {
+                    g_uvpActive   = true;
                     g_uvpIntegral = 0.0f;
-                    applySetCurrent();
                 }
+                if (g_uvpActive) {
+                    // Anti-windup: integral only accumulates in the negative (reducing) direction
+                    g_uvpIntegral = constrain(
+                        g_uvpIntegral + g_uvpKi * error * (dtH * 3600.0f),
+                        -setA, 0.0f);
+                    float cv_current = setA + g_uvpKp * error + g_uvpIntegral;
+                    applyCurrentDirect(constrain(cv_current, 0.0f, setA));
+                    // Exit CV mode with 0.5V hysteresis to avoid chattering
+                    if (error > 0.5f) {
+                        g_uvpActive   = false;
+                        g_uvpIntegral = 0.0f;
+                        applySetCurrent();
+                    }
+                }
+                if (g_uvpActive != wasActive && !g_debugScreen && !g_calViewScreen && g_calMode == CAL_NONE) {
+                    drawSetUVP();
+                }
+            } else if (g_uvpActive) {
+                // UVP disabled (setUVP==0) or load turned off — exit CV mode
+                g_uvpActive   = false;
+                g_uvpIntegral = 0.0f;
+                if (g_loadOn) applySetCurrent();
+                if (!g_debugScreen && !g_calViewScreen && g_calMode == CAL_NONE) drawSetUVP();
             }
-            if (g_uvpActive != wasActive && !g_debugScreen && !g_calViewScreen && g_calMode == CAL_NONE) {
-                drawSetUVP();
-            }
-        } else if (g_uvpActive) {
-            // UVP disabled (setUVP==0) or load turned off — exit CV mode
-            g_uvpActive   = false;
-            g_uvpIntegral = 0.0f;
-            if (g_loadOn) applySetCurrent();
-            if (!g_debugScreen && !g_calViewScreen && g_calMode == CAL_NONE) drawSetUVP();
         }
 
         if      (g_calMode != CAL_NONE) updateCalScreen();
-        else if (!g_debugScreen && !g_calViewScreen) updateValues();  // ~13.8 ms — 3 sprite groups pushed to TFT via SPI
+        else if (!g_debugScreen && !g_calViewScreen && !g_menuOpen) {
+            if (g_appMode == MODE_NORMAL) updateValues();
+            else updateEsrValues();
+        }
     }
 }
