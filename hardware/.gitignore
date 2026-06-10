@@ -1,0 +1,42 @@
+# KiCad .gitignore for hardware/ projects
+
+# KiCad auto-backups
+*-backups/
+
+# Per-user project-local settings (UI/window state, not design data)
+*.kicad_prl
+
+# Caches and lock files
+fp-info-cache
+*.lck
+*.kicad_pro.lck
+
+# Footprint/symbol library tables (machine-specific absolute paths)
+fp-lib-table
+sym-lib-table
+
+# Fabrication / production outputs (regenerated)
+production/
+fabrication-toolkit-options.json
+
+# KiCad temporary / rescue / autosave files
+*.000
+*.bak
+*.bck
+*.kicad_pcb-bak
+*_saved.kicad_pcb
+\#auto_saved_files#
+*.tmp
+*-save.pro
+*-save.kicad_pcb
+*-rescue.lib
+*-rescue.dcm
+
+# Editor local history (VS Code Local History extension)
+.history/
+.history_trim/
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -17,6 +17,15 @@ A programmable DC electronic load built on the Raspberry Pi Pico 2 (RP2350). It 
 
 I2C1 runs on GPIO 14 (SDA) / GPIO 15 (SCL) at 1 MHz.
 
+### Board design
+
+KiCad design files live in [`hardware/`](hardware/):
+
+- [`hardware/PlugInDC Load/`](hardware/PlugInDC%20Load/) — main plug-in board (MCU, DAC/ADC, pass elements, power supply)
+- [`hardware/Front Panel/`](hardware/Front%20Panel/) — front panel board
+
+Each project includes the schematic, PCB layout, a schematic PDF, and a STEP model.
+
 ## Specifications
 
 | Parameter | Range |
